@@ -16,34 +16,42 @@ def load_addresses(file_path):
         addresses = [line.strip() for line in f]
     return addresses
 
-# ERC-721 ABI
-with open('erc721_abi.json', 'r') as f:
-    erc721_abi = json.load(f)
+# Load ERC-721 ABI
+def load_abi(file_path):
+    with open(file_path, 'r') as f:
+        return json.load(f)
+
+erc721_abi = load_abi('erc721_abi.json')
 
 # Function to check if address owns any NFTs
-def check_nft_ownership(address, results):
-    # List of known NFT contract addresses (replace with actual contract addresses)
-    nft_contract_addresses = ["0x06012c8cf97BEaD5deAe237070F9587f8E7A266d", "0x..."]
-
+def check_nft_ownership(address, nft_contract_addresses, results):
     owns_nft = False
-    for contract_address in nft_contract_addresses:
-        contract = web3.eth.contract(address=contract_address, abi=erc721_abi)
-        balance = contract.functions.balanceOf(address).call()
-        if balance > 0:
-            owns_nft = True
-            break
-
+    try:
+        for contract_address in nft_contract_addresses:
+            contract = web3.eth.contract(address=contract_address, abi=erc721_abi)
+            balance = contract.functions.balanceOf(address).call()
+            if balance > 0:
+                owns_nft = True
+                break
+    except Exception as e:
+        print(f"Error checking address {address}: {e}")
+    
     results[address] = owns_nft
 
-# Multithreading setup
-def worker(address_queue, results):
+# Multithreading worker function
+def worker(address_queue, nft_contract_addresses, results):
     while not address_queue.empty():
         address = address_queue.get()
-        check_nft_ownership(address, results)
+        check_nft_ownership(address, nft_contract_addresses, results)
         address_queue.task_done()
 
 def main(input_file, output_file):
     addresses = load_addresses(input_file)
+    nft_contract_addresses = [
+        "0x06012c8cf97BEaD5deAe237070F9587f8E7A266d",  # Replace with actual contract addresses
+        # Add more NFT contract addresses here
+    ]
+    
     address_queue = Queue()
     results = {}
 
@@ -54,7 +62,7 @@ def main(input_file, output_file):
     threads = []
 
     for _ in range(num_threads):
-        thread = threading.Thread(target=worker, args=(address_queue, results))
+        thread = threading.Thread(target=worker, args=(address_queue, nft_contract_addresses, results))
         thread.start()
         threads.append(thread)
 
