@@ -5,26 +5,40 @@ from web3 import Web3
 import pandas as pd
 from queue import Queue
 from tqdm import tqdm
+import os
 
-# Web3 setup (replace with your Infura or other node provider URL)
-infura_url = "https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID"
-web3 = Web3(Web3.HTTPProvider(infura_url))
+# Configuration
+INFURA_URL = os.getenv('INFURA_URL', 'https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID')
+ABI_FILE = 'erc721_abi.json'
+NUM_THREADS = 10
+INPUT_FILE = 'input_addresses.txt'
+OUTPUT_FILE = 'nft_owners.csv'
 
-# Load addresses from file
+# Web3 setup
+web3 = Web3(Web3.HTTPProvider(INFURA_URL))
+
 def load_addresses(file_path):
-    with open(file_path, 'r') as f:
-        addresses = [line.strip() for line in f]
-    return addresses
+    """Load Ethereum addresses from a text file."""
+    try:
+        with open(file_path, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+    except Exception as e:
+        print(f"Error loading addresses from {file_path}: {e}")
+        return []
 
-# Load ERC-721 ABI
 def load_abi(file_path):
-    with open(file_path, 'r') as f:
-        return json.load(f)
+    """Load the ERC-721 ABI from a JSON file."""
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading ABI from {file_path}: {e}")
+        return []
 
-erc721_abi = load_abi('erc721_abi.json')
+erc721_abi = load_abi(ABI_FILE)
 
-# Function to check if address owns any NFTs
-def check_nft_ownership(address, nft_contract_addresses, results):
+def check_nft_ownership(address, nft_contract_addresses, results_queue):
+    """Check if the given address owns any NFTs from the specified contracts."""
     owns_nft = False
     try:
         for contract_address in nft_contract_addresses:
@@ -35,52 +49,59 @@ def check_nft_ownership(address, nft_contract_addresses, results):
                 break
     except Exception as e:
         print(f"Error checking address {address}: {e}")
-    
-    results[address] = owns_nft
+    finally:
+        results_queue.put((address, owns_nft))
 
-# Multithreading worker function
-def worker(address_queue, nft_contract_addresses, results):
+def worker(address_queue, nft_contract_addresses, results_queue):
+    """Worker thread function to process addresses from the queue."""
     while not address_queue.empty():
         address = address_queue.get()
-        check_nft_ownership(address, nft_contract_addresses, results)
-        address_queue.task_done()
+        try:
+            check_nft_ownership(address, nft_contract_addresses, results_queue)
+        finally:
+            address_queue.task_done()
 
 def main(input_file, output_file):
+    """Main function to coordinate the NFT ownership check."""
     addresses = load_addresses(input_file)
     nft_contract_addresses = [
         "0x06012c8cf97BEaD5deAe237070F9587f8E7A266d",  # Replace with actual contract addresses
         # Add more NFT contract addresses here
     ]
-    
+
     address_queue = Queue()
-    results = {}
+    results_queue = Queue()
 
     for address in addresses:
         address_queue.put(address)
 
-    num_threads = 10
     threads = []
-
-    for _ in range(num_threads):
-        thread = threading.Thread(target=worker, args=(address_queue, nft_contract_addresses, results))
+    for _ in range(NUM_THREADS):
+        thread = threading.Thread(target=worker, args=(address_queue, nft_contract_addresses, results_queue))
         thread.start()
         threads.append(thread)
 
     # Display progress
-    for _ in tqdm(range(len(addresses)), desc="Checking NFTs", unit="address"):
-        address_queue.join()
+    with tqdm(total=len(addresses), desc="Checking NFTs", unit="address") as pbar:
+        while not address_queue.empty():
+            address_queue.join()
+            pbar.update(pbar.n)
 
     for thread in threads:
         thread.join()
+
+    # Gather results
+    results = {}
+    while not results_queue.empty():
+        address, owns_nft = results_queue.get()
+        results[address] = owns_nft
 
     # Save results to file
     df = pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT'])
     df.to_csv(output_file, index=False)
 
 if __name__ == "__main__":
-    input_file = 'input_addresses.txt'
-    output_file = 'nft_owners.csv'
     start_time = time.time()
-    main(input_file, output_file)
+    main(INPUT_FILE, OUTPUT_FILE)
     elapsed_time = time.time() - start_time
     print(f"Elapsed time: {elapsed_time:.2f} seconds")
