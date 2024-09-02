@@ -33,9 +33,11 @@ def load_abi(file_path):
             return json.load(f)
     except Exception as e:
         print(f"Error loading ABI from {file_path}: {e}")
-        return []
+        return None
 
 erc721_abi = load_abi(ABI_FILE)
+if not erc721_abi:
+    raise ValueError("ABI file could not be loaded. Please check the file and try again.")
 
 def check_nft_ownership(address, nft_contract_addresses, results_queue):
     """Check if the given address owns any NFTs from the specified contracts."""
@@ -48,7 +50,7 @@ def check_nft_ownership(address, nft_contract_addresses, results_queue):
                 owns_nft = True
                 break
     except Exception as e:
-        print(f"Error checking address {address}: {e}")
+        print(f"Error checking ownership for address {address}: {e}")
     finally:
         results_queue.put((address, owns_nft))
 
@@ -64,6 +66,10 @@ def worker(address_queue, nft_contract_addresses, results_queue):
 def main(input_file, output_file):
     """Main function to coordinate the NFT ownership check."""
     addresses = load_addresses(input_file)
+    if not addresses:
+        print("No addresses loaded. Exiting.")
+        return
+
     nft_contract_addresses = [
         "0x06012c8cf97BEaD5deAe237070F9587f8E7A266d",  # Replace with actual contract addresses
         # Add more NFT contract addresses here
@@ -78,14 +84,17 @@ def main(input_file, output_file):
     threads = []
     for _ in range(NUM_THREADS):
         thread = threading.Thread(target=worker, args=(address_queue, nft_contract_addresses, results_queue))
+        thread.daemon = True  # Ensure threads close when main program exits
         thread.start()
         threads.append(thread)
 
     # Display progress
     with tqdm(total=len(addresses), desc="Checking NFTs", unit="address") as pbar:
         while not address_queue.empty():
-            address_queue.join()
-            pbar.update(pbar.n)
+            pbar.update(pbar.total - address_queue.qsize())
+            time.sleep(0.1)  # Small delay to allow threads to work
+
+    address_queue.join()  # Wait for all addresses to be processed
 
     for thread in threads:
         thread.join()
