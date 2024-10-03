@@ -15,6 +15,7 @@ ABI_FILE = 'erc721_abi.json'
 NUM_THREADS = 10
 INPUT_FILE = 'input_addresses.txt'
 OUTPUT_FILE = 'nft_owners.csv'
+CONTRACTS_FILE = 'nft_contracts.txt'
 LOG_FILE = 'nft_checker.log'
 
 # Logging setup
@@ -25,18 +26,18 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
 
-def load_addresses(file_path):
-    """Load Ethereum addresses from a text file."""
+def load_file_lines(file_path):
+    """Load non-empty lines from a file."""
     try:
         with open(file_path, 'r') as f:
             return [line.strip() for line in f if line.strip()]
     except Exception as e:
-        logging.error(f"Error loading addresses from {file_path}: {e}")
+        logging.error(f"Error loading data from {file_path}: {e}")
         return []
 
 
 def load_abi(file_path):
-    """Load the ERC-721 ABI from a JSON file."""
+    """Load ABI from a JSON file."""
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
@@ -51,7 +52,7 @@ if not erc721_abi:
 
 
 def check_nft_ownership(address, nft_contract_addresses):
-    """Check if the given address owns any NFTs from the specified contracts."""
+    """Check if the address owns NFTs from any of the specified contracts."""
     try:
         for contract_address in nft_contract_addresses:
             contract = web3.eth.contract(address=contract_address, abi=erc721_abi)
@@ -59,59 +60,52 @@ def check_nft_ownership(address, nft_contract_addresses):
             if balance > 0:
                 return True
     except Exception as e:
-        logging.error(f"Error checking ownership for address {address}: {e}")
+        logging.error(f"Error checking ownership for {address}: {e}")
     return False
 
 
 def process_address(address, nft_contract_addresses, results_queue):
-    """Process a single address to check for NFT ownership and store the result."""
+    """Process an address, check NFT ownership, and store the result."""
     owns_nft = check_nft_ownership(address, nft_contract_addresses)
     results_queue.put((address, owns_nft))
 
 
-def main(input_file, output_file):
-    """Main function to coordinate the NFT ownership check."""
-    addresses = load_addresses(input_file)
-    if not addresses:
-        logging.error("No addresses loaded. Exiting.")
-        return
+def main(input_file, output_file, contracts_file):
+    """Main function to coordinate NFT ownership checks."""
+    addresses = load_file_lines(input_file)
+    nft_contract_addresses = load_file_lines(contracts_file)
 
-    nft_contract_addresses = [
-        "0x06012c8cf97BEaD5deAe237070F9587f8E7A266d",  # Example contract (CryptoKitties)
-        # Add more NFT contract addresses here
-    ]
+    if not addresses or not nft_contract_addresses:
+        logging.error("No addresses or contracts loaded. Exiting.")
+        return
 
     results_queue = Queue()
 
-    # ThreadPoolExecutor for managing threads
+    # Use ThreadPoolExecutor for concurrent processing
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
         with tqdm(total=len(addresses), desc="Checking NFTs", unit="address") as pbar:
-            futures = []
-            for address in addresses:
-                future = executor.submit(process_address, address, nft_contract_addresses, results_queue)
-                futures.append(future)
+            futures = [executor.submit(process_address, address, nft_contract_addresses, results_queue) 
+                       for address in addresses]
 
             for future in futures:
-                future.result()  # This blocks until each thread completes
+                future.result()  # Block until each thread completes
                 pbar.update(1)
 
-    # Gather results
+    # Collect results
     results = {}
     while not results_queue.empty():
         address, owns_nft = results_queue.get()
         results[address] = owns_nft
 
     # Save results to CSV
-    df = pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT'])
-    df.to_csv(output_file, index=False)
-
+    pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT']).to_csv(output_file, index=False)
     logging.info(f"Results saved to {output_file}")
 
 
 if __name__ == "__main__":
     start_time = time.time()
     try:
-        main(INPUT_FILE, OUTPUT_FILE)
+        main(INPUT_FILE, OUTPUT_FILE, CONTRACTS_FILE)
     except Exception as e:
         logging.error(f"An error occurred: {e}")
     elapsed_time = time.time() - start_time
