@@ -7,16 +7,17 @@ from queue import Queue
 from tqdm import tqdm
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 # Configuration
 INFURA_URL = os.getenv('INFURA_URL', 'https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID')
-ABI_FILE = 'erc721_abi.json'
+ABI_FILE = Path('erc721_abi.json')
 NUM_THREADS = 10
-INPUT_FILE = 'input_addresses.txt'
-OUTPUT_FILE = 'nft_owners.csv'
-CONTRACTS_FILE = 'nft_contracts.txt'
-LOG_FILE = 'nft_checker.log'
+INPUT_FILE = Path('input_addresses.txt')
+OUTPUT_FILE = Path('nft_owners.csv')
+CONTRACTS_FILE = Path('nft_contracts.txt')
+LOG_FILE = Path('nft_checker.log')
 
 # Logging setup
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
@@ -29,8 +30,14 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 def load_file_lines(file_path):
     """Load non-empty lines from a file."""
     try:
-        with open(file_path, 'r') as f:
-            return [line.strip() for line in f if line.strip()]
+        if not file_path.exists():
+            raise FileNotFoundError(f"{file_path} not found.")
+        
+        with file_path.open('r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+            if not lines:
+                raise ValueError(f"{file_path} is empty.")
+            return lines
     except Exception as e:
         logging.error(f"Error loading data from {file_path}: {e}")
         return []
@@ -39,8 +46,14 @@ def load_file_lines(file_path):
 def load_abi(file_path):
     """Load ABI from a JSON file."""
     try:
-        with open(file_path, 'r') as f:
-            return json.load(f)
+        if not file_path.exists():
+            raise FileNotFoundError(f"ABI file {file_path} not found.")
+        
+        with file_path.open('r') as f:
+            abi = json.load(f)
+            if not abi:
+                raise ValueError(f"ABI file {file_path} is empty or invalid.")
+            return abi
     except Exception as e:
         logging.error(f"Error loading ABI from {file_path}: {e}")
         return None
@@ -60,14 +73,18 @@ def check_nft_ownership(address, nft_contract_addresses):
             if balance > 0:
                 return True
     except Exception as e:
-        logging.error(f"Error checking ownership for {address}: {e}")
+        logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
     return False
 
 
 def process_address(address, nft_contract_addresses, results_queue):
     """Process an address, check NFT ownership, and store the result."""
-    owns_nft = check_nft_ownership(address, nft_contract_addresses)
-    results_queue.put((address, owns_nft))
+    try:
+        owns_nft = check_nft_ownership(address, nft_contract_addresses)
+        results_queue.put((address, owns_nft))
+        logging.info(f"Processed address {address}, owns NFT: {owns_nft}")
+    except Exception as e:
+        logging.error(f"Error processing address {address}: {e}")
 
 
 def main(input_file, output_file, contracts_file):
@@ -83,19 +100,22 @@ def main(input_file, output_file, contracts_file):
 
     # Use ThreadPoolExecutor for concurrent processing
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        with tqdm(total=len(addresses), desc="Checking NFTs", unit="address") as pbar:
-            futures = [executor.submit(process_address, address, nft_contract_addresses, results_queue) 
-                       for address in addresses]
+        futures = {executor.submit(process_address, address, nft_contract_addresses, results_queue): address 
+                   for address in addresses}
 
-            for future in futures:
+        with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
+            for future in as_completed(futures):
                 future.result()  # Block until each thread completes
                 pbar.update(1)
 
-    # Collect results
+    # Collect results from the queue
     results = {}
     while not results_queue.empty():
-        address, owns_nft = results_queue.get()
-        results[address] = owns_nft
+        try:
+            address, owns_nft = results_queue.get_nowait()
+            results[address] = owns_nft
+        except Queue.Empty:
+            break
 
     # Save results to CSV
     pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT']).to_csv(output_file, index=False)
