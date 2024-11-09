@@ -1,14 +1,13 @@
 import time
 import json
-import threading
-from web3 import Web3
-import pandas as pd
-from queue import Queue
-from tqdm import tqdm
-import os
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue, Empty
+from tqdm import tqdm
+from web3 import Web3
+import pandas as pd
 
 # Configuration
 INFURA_URL = os.getenv('INFURA_URL', 'https://mainnet.infura.io/v3/YOUR_INFURA_PROJECT_ID')
@@ -20,8 +19,7 @@ CONTRACTS_FILE = Path('nft_contracts.txt')
 LOG_FILE = Path('nft_checker.log')
 
 # Logging setup
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Web3 setup
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -29,14 +27,14 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 
 def load_file_lines(file_path):
     """Load non-empty lines from a file."""
+    if not file_path.exists():
+        logging.error(f"{file_path} not found.")
+        return []
     try:
-        if not file_path.exists():
-            raise FileNotFoundError(f"{file_path} not found.")
-        
         with file_path.open('r') as f:
             lines = [line.strip() for line in f if line.strip()]
             if not lines:
-                raise ValueError(f"{file_path} is empty.")
+                logging.error(f"{file_path} is empty.")
             return lines
     except Exception as e:
         logging.error(f"Error loading data from {file_path}: {e}")
@@ -45,14 +43,14 @@ def load_file_lines(file_path):
 
 def load_abi(file_path):
     """Load ABI from a JSON file."""
+    if not file_path.exists():
+        logging.error(f"ABI file {file_path} not found.")
+        return None
     try:
-        if not file_path.exists():
-            raise FileNotFoundError(f"ABI file {file_path} not found.")
-        
         with file_path.open('r') as f:
             abi = json.load(f)
             if not abi:
-                raise ValueError(f"ABI file {file_path} is empty or invalid.")
+                logging.error(f"ABI file {file_path} is empty or invalid.")
             return abi
     except Exception as e:
         logging.error(f"Error loading ABI from {file_path}: {e}")
@@ -61,36 +59,32 @@ def load_abi(file_path):
 
 erc721_abi = load_abi(ABI_FILE)
 if not erc721_abi:
-    raise ValueError("ABI file could not be loaded. Please check the file and try again.")
+    raise RuntimeError("ABI file could not be loaded. Please check the file and try again.")
 
 
 def check_nft_ownership(address, nft_contract_addresses):
     """Check if the address owns NFTs from any of the specified contracts."""
-    try:
-        for contract_address in nft_contract_addresses:
+    for contract_address in nft_contract_addresses:
+        try:
             contract = web3.eth.contract(address=contract_address, abi=erc721_abi)
-            balance = contract.functions.balanceOf(address).call()
-            if balance > 0:
+            if contract.functions.balanceOf(address).call() > 0:
                 return True
-    except Exception as e:
-        logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
+        except Exception as e:
+            logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
     return False
 
 
 def process_address(address, nft_contract_addresses, results_queue):
     """Process an address, check NFT ownership, and store the result."""
-    try:
-        owns_nft = check_nft_ownership(address, nft_contract_addresses)
-        results_queue.put((address, owns_nft))
-        logging.info(f"Processed address {address}, owns NFT: {owns_nft}")
-    except Exception as e:
-        logging.error(f"Error processing address {address}: {e}")
+    owns_nft = check_nft_ownership(address, nft_contract_addresses)
+    results_queue.put((address, owns_nft))
+    logging.info(f"Processed address {address}, owns NFT: {owns_nft}")
 
 
-def main(input_file, output_file, contracts_file):
+def main():
     """Main function to coordinate NFT ownership checks."""
-    addresses = load_file_lines(input_file)
-    nft_contract_addresses = load_file_lines(contracts_file)
+    addresses = load_file_lines(INPUT_FILE)
+    nft_contract_addresses = load_file_lines(CONTRACTS_FILE)
 
     if not addresses or not nft_contract_addresses:
         logging.error("No addresses or contracts loaded. Exiting.")
@@ -100,7 +94,7 @@ def main(input_file, output_file, contracts_file):
 
     # Use ThreadPoolExecutor for concurrent processing
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = {executor.submit(process_address, address, nft_contract_addresses, results_queue): address 
+        futures = {executor.submit(process_address, address, nft_contract_addresses, results_queue): address
                    for address in addresses}
 
         with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
@@ -114,18 +108,18 @@ def main(input_file, output_file, contracts_file):
         try:
             address, owns_nft = results_queue.get_nowait()
             results[address] = owns_nft
-        except Queue.Empty:
+        except Empty:
             break
 
     # Save results to CSV
-    pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT']).to_csv(output_file, index=False)
-    logging.info(f"Results saved to {output_file}")
+    pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT']).to_csv(OUTPUT_FILE, index=False)
+    logging.info(f"Results saved to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
     start_time = time.time()
     try:
-        main(INPUT_FILE, OUTPUT_FILE, CONTRACTS_FILE)
+        main()
     except Exception as e:
         logging.error(f"An error occurred: {e}")
     elapsed_time = time.time() - start_time
