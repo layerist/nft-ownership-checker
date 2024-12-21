@@ -4,7 +4,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from queue import Queue, Empty
+from collections import deque
 from tqdm import tqdm
 from web3 import Web3
 import pandas as pd
@@ -31,7 +31,6 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.isConnected():
     raise RuntimeError("Failed to connect to the Ethereum network. Check your INFURA_URL or network connection.")
 
-
 def load_file_lines(file_path):
     """Load non-empty lines from a file."""
     if not file_path.exists():
@@ -47,6 +46,9 @@ def load_file_lines(file_path):
         logging.exception(f"Error loading data from {file_path}: {e}")
         return []
 
+def validate_eth_address(address):
+    """Validate an Ethereum address."""
+    return web3.isAddress(address)
 
 def load_abi(file_path):
     """Load ABI from a JSON file."""
@@ -65,42 +67,42 @@ def load_abi(file_path):
         logging.exception(f"Error loading ABI from {file_path}: {e}")
     return None
 
-
-def check_nft_ownership(address, nft_contract_addresses):
+def check_nft_ownership(address, nft_contract_addresses, abi):
     """Check if the address owns NFTs from any of the specified contracts."""
     for contract_address in nft_contract_addresses:
+        if not validate_eth_address(contract_address):
+            logging.warning(f"Invalid contract address: {contract_address}")
+            continue
         try:
-            contract = web3.eth.contract(address=contract_address, abi=erc721_abi)
+            contract = web3.eth.contract(address=contract_address, abi=abi)
             if contract.functions.balanceOf(address).call() > 0:
                 return True
         except Exception as e:
             logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
     return False
 
-
-def process_address(address, nft_contract_addresses, results_queue):
+def process_address(address, nft_contract_addresses, abi, results_deque):
     """Process an address, check NFT ownership, and store the result."""
     try:
-        owns_nft = check_nft_ownership(address, nft_contract_addresses)
-        results_queue.put((address, owns_nft))
+        owns_nft = check_nft_ownership(address, nft_contract_addresses, abi)
+        results_deque.append((address, owns_nft))
         logging.info(f"Processed address {address}, owns NFT: {owns_nft}")
     except Exception as e:
         logging.exception(f"Error processing address {address}: {e}")
 
-
 def save_results_to_csv(results, output_file):
     """Save the results to a CSV file."""
     try:
-        pd.DataFrame(list(results.items()), columns=['Address', 'Owns NFT']).to_csv(output_file, index=False)
+        pd.DataFrame(results, columns=['Address', 'Owns NFT']).to_csv(output_file, index=False)
         logging.info(f"Results saved to {output_file}")
     except Exception as e:
         logging.exception(f"Failed to save results to {output_file}: {e}")
-
 
 def main():
     """Main function to coordinate NFT ownership checks."""
     addresses = load_file_lines(INPUT_FILE)
     nft_contract_addresses = load_file_lines(CONTRACTS_FILE)
+    abi = load_abi(ABI_FILE)
 
     if not addresses:
         logging.error("No addresses found. Exiting.")
@@ -108,34 +110,27 @@ def main():
     if not nft_contract_addresses:
         logging.error("No NFT contracts found. Exiting.")
         return
+    if not abi:
+        logging.error("No valid ABI loaded. Exiting.")
+        return
 
-    results_queue = Queue()
-    results = {}
+    results_deque = deque()
 
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
         futures = {
-            executor.submit(process_address, address, nft_contract_addresses, results_queue): address
-            for address in addresses
+            executor.submit(process_address, address, nft_contract_addresses, abi, results_deque): address
+            for address in addresses if validate_eth_address(address)
         }
 
         with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
-            for future in as_completed(futures):
+            for future in as_completed(futures, timeout=60):  # Timeout prevents hanging
                 try:
-                    future.result()  # Block until each thread completes
+                    future.result()  # Ensure exceptions are raised
                 except Exception as e:
                     logging.exception(f"Error in thread: {e}")
                 pbar.update(1)
 
-    # Collect results from the queue
-    while not results_queue.empty():
-        try:
-            address, owns_nft = results_queue.get_nowait()
-            results[address] = owns_nft
-        except Empty:
-            break
-
-    save_results_to_csv(results, OUTPUT_FILE)
-
+    save_results_to_csv(results_deque, OUTPUT_FILE)
 
 if __name__ == "__main__":
     start_time = time.time()
