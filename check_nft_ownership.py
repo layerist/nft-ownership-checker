@@ -2,7 +2,7 @@ import time
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from pathlib import Path
 from collections import deque
 from tqdm import tqdm
@@ -17,6 +17,7 @@ INPUT_FILE = Path('input_addresses.txt')
 OUTPUT_FILE = Path('nft_owners.csv')
 CONTRACTS_FILE = Path('nft_contracts.txt')
 LOG_FILE = Path('nft_checker.log')
+CHECK_TIMEOUT = 10  # Seconds for checking ownership
 
 # Logging setup
 logging.basicConfig(
@@ -67,24 +68,23 @@ def load_abi(file_path):
         logging.exception(f"Error loading ABI from {file_path}: {e}")
     return None
 
-def check_nft_ownership(address, nft_contract_addresses, abi):
-    """Check if the address owns NFTs from any of the specified contracts."""
-    for contract_address in nft_contract_addresses:
-        if not validate_eth_address(contract_address):
-            logging.warning(f"Invalid contract address: {contract_address}")
-            continue
-        try:
-            contract = web3.eth.contract(address=contract_address, abi=abi)
-            if contract.functions.balanceOf(address).call() > 0:
-                return True
-        except Exception as e:
-            logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
-    return False
+def check_nft_ownership(address, contract_address, abi):
+    """Check if the address owns NFTs from the specified contract."""
+    try:
+        contract = web3.eth.contract(address=contract_address, abi=abi)
+        return contract.functions.balanceOf(address).call() > 0
+    except Exception as e:
+        logging.error(f"Error checking ownership for {address} on contract {contract_address}: {e}")
+        return False
 
 def process_address(address, nft_contract_addresses, abi, results_deque):
     """Process an address, check NFT ownership, and store the result."""
     try:
-        owns_nft = check_nft_ownership(address, nft_contract_addresses, abi)
+        owns_nft = any(
+            check_nft_ownership(address, contract_address, abi)
+            for contract_address in nft_contract_addresses
+            if validate_eth_address(contract_address)
+        )
         results_deque.append((address, owns_nft))
         logging.info(f"Processed address {address}, owns NFT: {owns_nft}")
     except Exception as e:
@@ -123,14 +123,16 @@ def main():
         }
 
         with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
-            for future in as_completed(futures, timeout=60):  # Timeout prevents hanging
+            for future in as_completed(futures, timeout=CHECK_TIMEOUT):  # Timeout prevents hanging
                 try:
                     future.result()  # Ensure exceptions are raised
+                except TimeoutError:
+                    logging.error(f"Timeout processing one of the addresses.")
                 except Exception as e:
                     logging.exception(f"Error in thread: {e}")
                 pbar.update(1)
 
-    save_results_to_csv(results_deque, OUTPUT_FILE)
+    save_results_to_csv(list(results_deque), OUTPUT_FILE)
 
 if __name__ == "__main__":
     start_time = time.time()
