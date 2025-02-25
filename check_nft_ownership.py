@@ -25,6 +25,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(console_handler)
 
 # Web3 setup
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
@@ -32,67 +35,48 @@ if not web3.isConnected():
     raise RuntimeError("Failed to connect to Ethereum network. Check INFURA_URL.")
 
 def load_file_lines(file_path):
-    """Load non-empty, unique lines from a file."""
-    if not file_path.exists():
-        logging.error(f"{file_path} not found.")
-        return set()
+    """Load unique, non-empty lines from a file."""
     try:
-        with file_path.open('r') as f:
-            lines = {line.strip() for line in f if line.strip()}
-        if not lines:
-            logging.error(f"{file_path} is empty.")
-        return lines
+        if file_path.exists():
+            with file_path.open('r') as f:
+                return {line.strip() for line in f if line.strip()}
+        logging.error(f"{file_path} not found or empty.")
     except Exception as e:
-        logging.exception(f"Error loading data from {file_path}: {e}")
-        return set()
-
-def validate_eth_address(address):
-    """Validate an Ethereum address."""
-    return web3.isAddress(address)
+        logging.exception(f"Error reading {file_path}: {e}")
+    return set()
 
 def load_abi(file_path):
     """Load ABI from a JSON file."""
-    if not file_path.exists():
-        logging.error(f"ABI file {file_path} not found.")
-        return None
     try:
-        with file_path.open('r') as f:
-            abi = json.load(f)
-        if not abi:
-            logging.error(f"ABI file {file_path} is empty or invalid.")
-        return abi
+        if file_path.exists():
+            with file_path.open('r') as f:
+                return json.load(f)
+        logging.error(f"ABI file {file_path} not found.")
     except json.JSONDecodeError:
-        logging.error(f"Failed to decode JSON from {file_path}. Ensure proper formatting.")
+        logging.error(f"Invalid JSON format in {file_path}.")
     except Exception as e:
         logging.exception(f"Error loading ABI from {file_path}: {e}")
     return None
 
 def check_nft_ownership(address, contract_address, abi):
-    """Check if the address owns NFTs from the specified contract."""
+    """Check if an address owns NFTs from the given contract."""
     try:
         contract = web3.eth.contract(address=contract_address, abi=abi)
         return contract.functions.balanceOf(address).call() > 0
     except exceptions.ContractLogicError as e:
-        logging.error(f"Contract logic error for {contract_address}: {e}")
+        logging.warning(f"Contract logic error for {contract_address}: {e}")
     except Exception as e:
-        logging.error(f"Error checking ownership for {address} on {contract_address}: {e}")
+        logging.error(f"Error checking {address} on {contract_address}: {e}")
     return False
 
-def process_address(address, nft_contract_addresses, abi, results_deque):
-    """Process an address, check NFT ownership, and store the result."""
-    try:
-        owns_nft = any(
-            check_nft_ownership(address, contract_address, abi)
-            for contract_address in nft_contract_addresses
-            if validate_eth_address(contract_address)
-        )
-        results_deque.append((address, owns_nft))
-        logging.info(f"Processed {address}: Owns NFT = {owns_nft}")
-    except Exception as e:
-        logging.exception(f"Error processing {address}: {e}")
+def process_address(address, contract_addresses, abi, results):
+    """Check NFT ownership for an address across multiple contracts."""
+    owns_nft = any(check_nft_ownership(address, contract, abi) for contract in contract_addresses)
+    results.append((address, owns_nft))
+    logging.info(f"Processed {address}: Owns NFT = {owns_nft}")
 
 def save_results_to_csv(results, output_file):
-    """Save the results to a CSV file."""
+    """Save results to a CSV file."""
     try:
         df = pd.DataFrame(results, columns=['Address', 'Owns NFT'])
         df.to_csv(output_file, index=False)
@@ -101,39 +85,33 @@ def save_results_to_csv(results, output_file):
         logging.exception(f"Failed to save results to {output_file}: {e}")
 
 def main():
-    """Main function to coordinate NFT ownership checks."""
+    """Main function to check NFT ownership."""
     addresses = load_file_lines(INPUT_FILE)
-    nft_contract_addresses = load_file_lines(CONTRACTS_FILE)
+    contracts = load_file_lines(CONTRACTS_FILE)
     abi = load_abi(ABI_FILE)
 
-    if not addresses:
-        logging.error("No valid addresses found. Exiting.")
-        return
-    if not nft_contract_addresses:
-        logging.error("No NFT contracts found. Exiting.")
-        return
-    if not abi:
-        logging.error("No valid ABI loaded. Exiting.")
+    if not addresses or not contracts or not abi:
+        logging.error("Missing data. Ensure input files exist and contain valid data.")
         return
 
-    results_deque = deque()
-    valid_addresses = {addr for addr in addresses if validate_eth_address(addr)}
+    valid_addresses = {addr for addr in addresses if web3.isAddress(addr)}
+    results = deque()
 
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
         futures = {
-            executor.submit(process_address, address, nft_contract_addresses, abi, results_deque): address
-            for address in valid_addresses
+            executor.submit(process_address, addr, contracts, abi, results): addr
+            for addr in valid_addresses
         }
 
         with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
-            for future in as_completed(futures):  # No timeout here
+            for future in as_completed(futures):
                 try:
-                    future.result()  # Ensures exceptions are raised
+                    future.result()
                 except Exception as e:
-                    logging.error(f"Thread error: {e}")
+                    logging.error(f"Error processing an address: {e}")
                 pbar.update(1)
 
-    save_results_to_csv(list(results_deque), OUTPUT_FILE)
+    save_results_to_csv(list(results), OUTPUT_FILE)
 
 if __name__ == "__main__":
     start_time = time.time()
