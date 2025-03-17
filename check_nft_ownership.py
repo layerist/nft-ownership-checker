@@ -34,31 +34,29 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.isConnected():
     raise RuntimeError("Failed to connect to Ethereum network. Check INFURA_URL.")
 
-def load_file_lines(file_path):
+def load_file_lines(file_path: Path) -> set:
     """Load unique, non-empty lines from a file."""
     try:
         if file_path.exists():
-            with file_path.open('r') as f:
+            with file_path.open('r', encoding='utf-8') as f:
                 return {line.strip() for line in f if line.strip()}
         logging.error(f"{file_path} not found or empty.")
     except Exception as e:
         logging.exception(f"Error reading {file_path}: {e}")
     return set()
 
-def load_abi(file_path):
+def load_abi(file_path: Path):
     """Load ABI from a JSON file."""
     try:
         if file_path.exists():
-            with file_path.open('r') as f:
+            with file_path.open('r', encoding='utf-8') as f:
                 return json.load(f)
         logging.error(f"ABI file {file_path} not found.")
-    except json.JSONDecodeError:
-        logging.error(f"Invalid JSON format in {file_path}.")
-    except Exception as e:
+    except (json.JSONDecodeError, Exception) as e:
         logging.exception(f"Error loading ABI from {file_path}: {e}")
     return None
 
-def check_nft_ownership(address, contract_address, abi):
+def check_nft_ownership(address: str, contract_address: str, abi) -> bool:
     """Check if an address owns NFTs from the given contract."""
     try:
         contract = web3.eth.contract(address=contract_address, abi=abi)
@@ -69,13 +67,13 @@ def check_nft_ownership(address, contract_address, abi):
         logging.error(f"Error checking {address} on {contract_address}: {e}")
     return False
 
-def process_address(address, contract_addresses, abi, results):
+def process_address(address: str, contract_addresses: set, abi) -> tuple:
     """Check NFT ownership for an address across multiple contracts."""
     owns_nft = any(check_nft_ownership(address, contract, abi) for contract in contract_addresses)
-    results.append((address, owns_nft))
     logging.info(f"Processed {address}: Owns NFT = {owns_nft}")
+    return address, owns_nft
 
-def save_results_to_csv(results, output_file):
+def save_results_to_csv(results: list, output_file: Path):
     """Save results to a CSV file."""
     try:
         df = pd.DataFrame(results, columns=['Address', 'Owns NFT'])
@@ -95,23 +93,19 @@ def main():
         return
 
     valid_addresses = {addr for addr in addresses if web3.isAddress(addr)}
-    results = deque()
+    results = []
 
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = {
-            executor.submit(process_address, addr, contracts, abi, results): addr
-            for addr in valid_addresses
-        }
-
-        with tqdm(total=len(futures), desc="Checking NFTs", unit="address") as pbar:
-            for future in as_completed(futures):
+        future_to_address = {executor.submit(process_address, addr, contracts, abi): addr for addr in valid_addresses}
+        with tqdm(total=len(future_to_address), desc="Checking NFTs", unit="address") as pbar:
+            for future in as_completed(future_to_address):
                 try:
-                    future.result()
+                    results.append(future.result())
                 except Exception as e:
-                    logging.error(f"Error processing an address: {e}")
+                    logging.error(f"Error processing address {future_to_address[future]}: {e}")
                 pbar.update(1)
 
-    save_results_to_csv(list(results), OUTPUT_FILE)
+    save_results_to_csv(results, OUTPUT_FILE)
 
 if __name__ == "__main__":
     start_time = time.time()
