@@ -38,60 +38,60 @@ if not web3.is_connected():
 def load_lines(file_path: Path) -> Set[str]:
     """Load unique, non-empty lines from a file."""
     if not file_path.exists():
-        logging.error(f"Missing file: {file_path}")
+        logging.error(f"File not found: {file_path}")
         return set()
     with file_path.open("r", encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
 
 def load_abi(file_path: Path) -> Optional[List[dict]]:
-    """Load a contract ABI from a JSON file."""
+    """Load contract ABI from a JSON file."""
     if not file_path.exists():
         logging.error(f"ABI file not found: {file_path}")
         return None
     try:
         with file_path.open("r", encoding="utf-8") as f:
             abi = json.load(f)
-        if not isinstance(abi, list):
-            logging.error("Invalid ABI format. Expected a list.")
-            return None
-        return abi
+        if isinstance(abi, list):
+            return abi
+        logging.error("Invalid ABI format: expected a list.")
     except Exception as e:
-        logging.exception(f"Error loading ABI: {e}")
-        return None
+        logging.exception(f"Failed to load ABI: {e}")
+    return None
 
 def init_contract(address: str, abi: List[dict]) -> Optional[Contract]:
-    """Create a contract instance from an address and ABI."""
+    """Initialize a contract instance from its address and ABI."""
     try:
-        return web3.eth.contract(address=web3.to_checksum_address(address), abi=abi)
+        checksum_address = web3.to_checksum_address(address)
+        return web3.eth.contract(address=checksum_address, abi=abi)
     except Exception as e:
         logging.error(f"Failed to initialize contract {address}: {e}")
         return None
 
 def has_nft(address: str, contract: Contract) -> bool:
-    """Return True if the address owns at least one token in the contract."""
+    """Check if an address owns at least one token in the contract."""
     try:
         balance = contract.functions.balanceOf(web3.to_checksum_address(address)).call()
         return balance > 0
     except exceptions.ContractLogicError as e:
-        logging.warning(f"Contract logic error for {contract.address}: {e}")
+        logging.warning(f"Logic error in contract {contract.address}: {e}")
     except Exception as e:
-        logging.error(f"Error checking balance for {address} in {contract.address}: {e}")
+        logging.error(f"Error checking NFT ownership for {address}: {e}")
     return False
 
 def check_nft_ownership(address: str, contracts: List[Contract]) -> Tuple[str, bool]:
-    """Check whether the address owns NFTs in any of the provided contracts."""
+    """Check if an address owns any NFTs across multiple contracts."""
     owns = any(has_nft(address, contract) for contract in contracts)
-    logging.info(f"{address} NFT ownership: {owns}")
+    logging.info(f"Address {address} owns NFT: {owns}")
     return address, owns
 
 def save_results(results: List[Tuple[str, bool]], file_path: Path):
-    """Save results to CSV."""
+    """Save ownership results to a CSV file."""
     try:
         df = pd.DataFrame(results, columns=["Address", "Owns NFT"])
         df.to_csv(file_path, index=False)
-        logging.info(f"Results written to {file_path}")
+        logging.info(f"Results saved to {file_path}")
     except Exception as e:
-        logging.exception(f"Failed to save CSV: {e}")
+        logging.exception(f"Failed to write results to CSV: {e}")
 
 def main():
     addresses = load_lines(INPUT_FILE)
@@ -99,44 +99,56 @@ def main():
     abi = load_abi(ABI_FILE)
 
     if not addresses:
-        logging.error("No input addresses found.")
+        logging.error("No addresses provided.")
         return
     if not contract_addresses:
-        logging.error("No contract addresses found.")
+        logging.error("No contract addresses provided.")
         return
     if abi is None:
-        logging.error("ABI loading failed.")
+        logging.error("Failed to load ABI.")
         return
 
-    valid_addresses = [addr for addr in addresses if web3.is_address(addr)]
+    # Filter and normalize input addresses
+    valid_addresses = []
+    for addr in addresses:
+        if web3.is_address(addr):
+            valid_addresses.append(web3.to_checksum_address(addr))
+        else:
+            logging.warning(f"Invalid address skipped: {addr}")
+
+    # Initialize contract instances
     contracts = [init_contract(addr, abi) for addr in contract_addresses]
     contracts = [c for c in contracts if c]
-
     if not contracts:
         logging.error("No valid contracts initialized.")
         return
 
+    # Multithreaded checking
     results: List[Tuple[str, bool]] = []
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = {executor.submit(check_nft_ownership, addr, contracts): addr for addr in valid_addresses}
-        with tqdm(total=len(futures), desc="Checking addresses", unit="address") as pbar:
+        futures = {
+            executor.submit(check_nft_ownership, address, contracts): address
+            for address in valid_addresses
+        }
+        with tqdm(total=len(futures), desc="Checking NFT ownership", unit="address") as pbar:
             for future in as_completed(futures):
+                address = futures[future]
                 try:
                     result = future.result()
                     results.append(result)
                 except Exception as e:
-                    logging.error(f"Error checking address {futures[future]}: {e}")
+                    logging.error(f"Unhandled exception while checking {address}: {e}")
                 finally:
                     pbar.update(1)
 
     save_results(results, OUTPUT_FILE)
 
 if __name__ == "__main__":
-    start = time.time()
+    start_time = time.time()
     try:
         main()
     except Exception as e:
-        logging.exception(f"Unhandled exception: {e}")
-    duration = time.time() - start
-    logging.info(f"Completed in {duration:.2f} seconds.")
+        logging.exception(f"Fatal error: {e}")
+    duration = time.time() - start_time
+    logging.info(f"Script finished in {duration:.2f} seconds.")
     print(f"Done in {duration:.2f} seconds.")
