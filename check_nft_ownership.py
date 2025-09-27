@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import signal
+import random
 from pathlib import Path
 from typing import Set, List, Tuple, Optional, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,7 @@ LOG_FILE = Path("nft_checker.log")
 
 NUM_THREADS = 10
 MAX_RETRIES = 3
-RETRY_DELAY = 1.5  # seconds
+BASE_DELAY = 1.5  # seconds
 SHOW_PROGRESS = True  # set False in CI/CD to disable tqdm
 
 # ==============================
@@ -47,31 +48,34 @@ web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.is_connected():
     raise ConnectionError("Unable to connect to Ethereum via Infura.")
 
+
 # ==============================
 # Helpers
 # ==============================
-def retry_on_failure(max_retries: int = MAX_RETRIES, delay: float = RETRY_DELAY) -> Callable:
-    """Retry decorator for transient errors."""
+def retry_on_failure(max_retries: int = MAX_RETRIES, base_delay: float = BASE_DELAY) -> Callable:
+    """Retry decorator with exponential backoff for transient errors."""
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
+            delay = base_delay
             for attempt in range(1, max_retries + 1):
                 try:
                     return func(*args, **kwargs)
                 except exceptions.ContractLogicError:
-                    # Permanent error, don’t retry
-                    logging.debug(f"Contract logic error in {func.__name__} for {args}: aborting.")
+                    logging.debug(f"Permanent contract logic error in {func.__name__} for args={args}.")
                     return False
                 except Exception as e:
                     logging.warning(f"[Attempt {attempt}/{max_retries}] {func.__name__} failed: {e}")
                     if attempt < max_retries:
-                        time.sleep(delay)
+                        time.sleep(delay + random.uniform(0, 0.5))  # jitter
+                        delay *= 2
             return False
         return wrapper
     return decorator
 
 
 def load_lines(path: Path) -> Set[str]:
+    """Read non-empty lines from a file into a set of strings."""
     if not path.exists():
         logging.error(f"File not found: {path}")
         return set()
@@ -84,6 +88,7 @@ def load_lines(path: Path) -> Set[str]:
 
 
 def load_abi(path: Path) -> Optional[List[dict]]:
+    """Load an ABI from a JSON file."""
     if not path.exists():
         logging.error(f"ABI file not found: {path}")
         return None
@@ -99,7 +104,8 @@ def load_abi(path: Path) -> Optional[List[dict]]:
 
 
 @lru_cache(maxsize=None)
-def init_contract(address: str, abi: List[dict]) -> Optional[Contract]:
+def init_contract(address: str, abi: Tuple[dict, ...]) -> Optional[Contract]:
+    """Initialize a contract object, cached by address."""
     try:
         return web3.eth.contract(address=web3.to_checksum_address(address), abi=abi)
     except Exception as e:
@@ -109,21 +115,23 @@ def init_contract(address: str, abi: List[dict]) -> Optional[Contract]:
 
 @retry_on_failure()
 def has_nft(address: str, contract: Contract) -> bool:
-    """Check if address owns any NFTs in the given contract."""
+    """Check if an address owns any NFTs in the given contract."""
     balance = contract.functions.balanceOf(address).call()
     return balance > 0
 
 
 def check_nft_ownership(address: str, contracts: List[Contract]) -> Tuple[str, bool]:
+    """Return whether an address owns an NFT in any of the given contracts."""
     for contract in contracts:
         if has_nft(address, contract):
-            logging.info(f"{address}: owns NFT in {contract.address}")
+            logging.info(f"{address} owns NFT in {contract.address}")
             return address, True
-    logging.info(f"{address}: does not own NFT")
+    logging.info(f"{address} does not own any NFTs")
     return address, False
 
 
 def save_results(results: List[Tuple[str, bool]], path: Path) -> None:
+    """Save results to CSV."""
     try:
         df = pd.DataFrame(sorted(results), columns=["Address", "Owns NFT"])
         df.to_csv(path, index=False)
@@ -133,6 +141,7 @@ def save_results(results: List[Tuple[str, bool]], path: Path) -> None:
 
 
 def validate_addresses(addresses: Set[str]) -> List[str]:
+    """Return a list of valid checksummed Ethereum addresses."""
     valid = []
     for addr in addresses:
         if web3.is_address(addr):
@@ -143,6 +152,7 @@ def validate_addresses(addresses: Set[str]) -> List[str]:
 
 
 def load_contracts(contract_addresses: Set[str], abi: List[dict]) -> List[Contract]:
+    """Load and initialize contract objects from addresses."""
     contracts = [init_contract(addr, tuple(abi)) for addr in contract_addresses]
     valid = [c for c in contracts if c]
     if not valid:
