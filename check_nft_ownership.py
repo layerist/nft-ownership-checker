@@ -6,7 +6,7 @@ import signal
 import random
 from pathlib import Path
 from typing import Set, List, Tuple, Optional, Dict, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from functools import lru_cache, wraps
 from threading import Lock
 
@@ -25,9 +25,9 @@ OUTPUT_FILE = Path("nft_owners.csv")
 CONTRACTS_FILE = Path("nft_contracts.txt")
 LOG_FILE = Path("nft_checker.log")
 
-NUM_THREADS = 12
-MAX_RETRIES = 4
-BASE_DELAY = 1.5  # seconds
+NUM_THREADS = int(os.getenv("NUM_THREADS", "12"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "4"))
+BASE_DELAY = float(os.getenv("BASE_DELAY", "1.5"))
 SHOW_PROGRESS = True
 
 # ============================================
@@ -47,13 +47,20 @@ logging.basicConfig(
 # ============================================
 web3 = Web3(Web3.HTTPProvider(INFURA_URL))
 if not web3.is_connected():
-    raise ConnectionError("Unable to connect to Ethereum via Infura.")
+    raise ConnectionError(f"Unable to connect to Ethereum via Infura ({INFURA_URL})")
+
+logging.info("Connected to Ethereum mainnet.")
 
 # ============================================
 # Utility Functions
 # ============================================
-def retry_on_failure(max_retries: int = MAX_RETRIES, base_delay: float = BASE_DELAY) -> Callable:
-    """Decorator with exponential backoff and jitter."""
+def retry_on_failure(
+    max_retries: int = MAX_RETRIES,
+    base_delay: float = BASE_DELAY,
+    retry_exceptions: Tuple[type, ...] = (Exception,),
+    fatal_exceptions: Tuple[type, ...] = (exceptions.ContractLogicError,)
+) -> Callable:
+    """Decorator with exponential backoff, jitter, and configurable retry behavior."""
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -61,27 +68,32 @@ def retry_on_failure(max_retries: int = MAX_RETRIES, base_delay: float = BASE_DE
             for attempt in range(1, max_retries + 1):
                 try:
                     return func(*args, **kwargs)
-                except exceptions.ContractLogicError:
-                    logging.debug(f"Contract logic error in {func.__name__}, args={args}")
+                except fatal_exceptions as e:
+                    logging.debug(f"Fatal contract logic error in {func.__name__}: {e}")
                     return False
-                except Exception as e:
-                    logging.warning(f"{func.__name__} failed (attempt {attempt}/{max_retries}): {e}")
-                    if attempt < max_retries:
-                        time.sleep(delay + random.uniform(0, delay * 0.3))
-                        delay *= 2
-            return False
+                except retry_exceptions as e:
+                    if attempt == max_retries:
+                        logging.error(f"{func.__name__} failed after {attempt} attempts: {e}")
+                        return False
+                    jitter = random.uniform(0, delay * 0.3)
+                    sleep_time = delay + jitter
+                    logging.warning(f"{func.__name__} retry {attempt}/{max_retries}: {e} — sleeping {sleep_time:.2f}s")
+                    time.sleep(sleep_time)
+                    delay *= 2
         return wrapper
     return decorator
 
 
 def load_lines(path: Path) -> Set[str]:
-    """Read non-empty unique lines from a file."""
+    """Read unique non-empty lines from a file."""
     if not path.exists():
         logging.error(f"File not found: {path}")
         return set()
     try:
         with path.open("r", encoding="utf-8") as f:
-            return {line.strip() for line in f if line.strip()}
+            lines = {line.strip() for line in f if line.strip()}
+        logging.info(f"Loaded {len(lines)} lines from {path}")
+        return lines
     except Exception as e:
         logging.exception(f"Failed to read {path}: {e}")
         return set()
@@ -89,9 +101,6 @@ def load_lines(path: Path) -> Set[str]:
 
 def load_abi(path: Path) -> Optional[List[dict]]:
     """Load ERC721 ABI JSON."""
-    if not path.exists():
-        logging.error(f"Missing ABI file: {path}")
-        return None
     try:
         with path.open("r", encoding="utf-8") as f:
             abi = json.load(f)
@@ -105,7 +114,7 @@ def load_abi(path: Path) -> Optional[List[dict]]:
 
 @lru_cache(maxsize=None)
 def init_contract(address: str, abi: Tuple[dict, ...]) -> Optional[Contract]:
-    """Cached contract initialization."""
+    """Initialize and cache contract instance."""
     try:
         return web3.eth.contract(address=web3.to_checksum_address(address), abi=abi)
     except Exception as e:
@@ -115,26 +124,22 @@ def init_contract(address: str, abi: Tuple[dict, ...]) -> Optional[Contract]:
 
 @retry_on_failure()
 def has_nft(address: str, contract: Contract) -> bool:
-    """Check if the address holds NFTs from this contract."""
+    """Check if an address holds NFTs from this contract."""
     balance = contract.functions.balanceOf(address).call()
     return balance > 0
 
 
 def check_nft_ownership(address: str, contracts: List[Contract]) -> Tuple[str, bool]:
-    """Return (address, True) if user owns NFT in any contract."""
-    try:
-        for contract in contracts:
-            if has_nft(address, contract):
-                logging.info(f"{address} owns NFT in {contract.address}")
-                return address, True
-        return address, False
-    except Exception as e:
-        logging.warning(f"Error checking ownership for {address}: {e}")
-        return address, False
+    """Return (address, True) if address owns NFT in any given contract."""
+    for contract in contracts:
+        if has_nft(address, contract):
+            logging.info(f"{address} owns NFT in {contract.address}")
+            return address, True
+    return address, False
 
 
 def validate_addresses(addresses: Set[str]) -> List[str]:
-    """Validate and checksum all Ethereum addresses."""
+    """Filter and checksum valid Ethereum addresses."""
     valid = []
     for addr in addresses:
         if web3.is_address(addr):
@@ -145,26 +150,38 @@ def validate_addresses(addresses: Set[str]) -> List[str]:
 
 
 def load_contracts(contract_addresses: Set[str], abi: List[dict]) -> List[Contract]:
-    """Load all valid ERC721 contracts."""
+    """Load valid ERC721 contract objects."""
     contracts = [init_contract(addr, tuple(abi)) for addr in contract_addresses]
     valid_contracts = [c for c in contracts if c]
     if not valid_contracts:
         logging.error("No valid NFT contracts loaded.")
+    else:
+        logging.info(f"Loaded {len(valid_contracts)} valid contracts.")
     return valid_contracts
 
 
-def save_results(results: List[Tuple[str, bool]], path: Path, lock: Optional[Lock] = None) -> None:
-    """Save current progress to CSV (thread-safe)."""
-    try:
-        df = pd.DataFrame(sorted(results), columns=["Address", "Owns NFT"])
-        if lock:
-            with lock:
-                df.to_csv(path, index=False)
+def atomic_write_csv(df: pd.DataFrame, path: Path) -> None:
+    """Write DataFrame atomically (safe for interruption)."""
+    tmp_path = path.with_suffix(".tmp")
+    df.to_csv(tmp_path, index=False)
+    tmp_path.replace(path)
+
+
+def save_results_incremental(
+    new_results: List[Tuple[str, bool]],
+    path: Path,
+    lock: Lock
+) -> None:
+    """Append results incrementally (thread-safe)."""
+    if not new_results:
+        return
+    df = pd.DataFrame(new_results, columns=["Address", "Owns NFT"])
+    with lock:
+        if path.exists():
+            df.to_csv(path, index=False, mode="a", header=False)
         else:
             df.to_csv(path, index=False)
-        logging.info(f"Saved {len(results)} results to {path}")
-    except Exception as e:
-        logging.exception(f"Failed to save CSV: {e}")
+    logging.info(f"Appended {len(new_results)} new results.")
 
 
 # ============================================
@@ -175,14 +192,8 @@ def main() -> None:
     contracts_raw = load_lines(CONTRACTS_FILE)
     abi = load_abi(ABI_FILE)
 
-    if not addresses_raw:
-        logging.error("No addresses provided.")
-        return
-    if not contracts_raw:
-        logging.error("No contract addresses provided.")
-        return
-    if not abi:
-        logging.error("ABI not loaded.")
+    if not addresses_raw or not contracts_raw or not abi:
+        logging.error("Missing required input files or ABI.")
         return
 
     addresses = validate_addresses(addresses_raw)
@@ -192,35 +203,47 @@ def main() -> None:
 
     results: List[Tuple[str, bool]] = []
     results_lock = Lock()
-
     interrupted = False
 
     def handle_interrupt(sig, frame):
         nonlocal interrupted
-        logging.warning("Interrupted by user — saving progress...")
         interrupted = True
+        logging.warning("KeyboardInterrupt detected — stopping gracefully...")
 
     signal.signal(signal.SIGINT, handle_interrupt)
 
+    logging.info(f"Starting NFT ownership checks for {len(addresses)} addresses using {NUM_THREADS} threads...")
+
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = {executor.submit(check_nft_ownership, addr, contracts): addr for addr in addresses}
+        futures: Dict[Future, str] = {executor.submit(check_nft_ownership, addr, contracts): addr for addr in addresses}
+
         with tqdm(total=len(futures), desc="Checking NFT ownership", unit="addr", disable=not SHOW_PROGRESS) as pbar:
+            batch: List[Tuple[str, bool]] = []
             for future in as_completed(futures):
                 if interrupted:
                     break
-                address = futures[future]
+                addr = futures[future]
                 try:
-                    result = future.result()
-                    results.append(result)
+                    result = future.result(timeout=30)
+                    batch.append(result)
                 except Exception as e:
-                    logging.exception(f"Unhandled error for {address}: {e}")
+                    logging.error(f"Unhandled error for {addr}: {e}")
+                    batch.append((addr, False))
                 finally:
                     pbar.update(1)
-                    if len(results) % 50 == 0:  # autosave every 50
-                        save_results(results, OUTPUT_FILE, results_lock)
+                    if len(batch) >= 50:
+                        save_results_incremental(batch, OUTPUT_FILE, results_lock)
+                        results.extend(batch)
+                        batch.clear()
 
-    save_results(results, OUTPUT_FILE, results_lock)
-    logging.info(f"Checked {len(results)} addresses total.")
+            # Save remaining
+            if batch:
+                save_results_incremental(batch, OUTPUT_FILE, results_lock)
+                results.extend(batch)
+
+    total = len(results)
+    owns = sum(1 for _, has in results if has)
+    logging.info(f"Completed: {total} checked, {owns} own NFTs ({owns/total:.2%}).")
 
 
 # ============================================
