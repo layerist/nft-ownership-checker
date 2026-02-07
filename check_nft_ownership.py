@@ -2,13 +2,12 @@
 """
 Production-grade multithreaded ERC-721 ownership checker.
 
-Key improvements over the original:
-- Strict separation of I/O, Web3, and execution logic
-- Deterministic retries with typed return values
-- Cooperative shutdown (SIGINT-safe, no orphan threads)
-- Reduced RPC load via short-circuiting and caching
-- Safer CSV appends with explicit flushing
-- Clearer typing and error semantics
+Highlights:
+- Per-thread Web3 providers (thread-safe)
+- Deterministic retries with exponential backoff + jitter
+- Cooperative SIGINT shutdown (no orphan futures)
+- RPC short-circuiting (stop on first positive balance)
+- Safe, flushed CSV appends
 """
 
 from __future__ import annotations
@@ -21,18 +20,16 @@ import signal
 import random
 from pathlib import Path
 from typing import (
-    Set,
+    Iterable,
     List,
     Tuple,
-    Optional,
     Dict,
     Callable,
-    Iterable,
     Sequence,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from functools import lru_cache, wraps
-from threading import Lock, Event
+from threading import Lock, Event, local
 
 import pandas as pd
 from tqdm import tqdm
@@ -71,13 +68,18 @@ logging.basicConfig(
 )
 
 # ======================================================
-# Web3 Initialization
+# Thread-local Web3
 # ======================================================
-web3 = Web3(Web3.HTTPProvider(INFURA_URL, request_kwargs={"timeout": 20}))
-if not web3.is_connected():
-    raise ConnectionError("Failed to connect to Ethereum RPC")
+_thread_ctx = local()
 
-logging.info("Connected to Ethereum mainnet")
+def get_web3() -> Web3:
+    if not hasattr(_thread_ctx, "web3"):
+        w3 = Web3(Web3.HTTPProvider(INFURA_URL, request_kwargs={"timeout": 20}))
+        if not w3.is_connected():
+            raise ConnectionError("Failed to connect to Ethereum RPC")
+        _thread_ctx.web3 = w3
+    return _thread_ctx.web3
+
 
 # ======================================================
 # Retry Decorator
@@ -86,7 +88,7 @@ def retry_on_failure(
     *,
     max_retries: int = MAX_RETRIES,
     base_delay: float = BASE_DELAY,
-    retry_exceptions: Tuple[type, ...] = (
+    retry_exceptions: tuple[type, ...] = (
         exceptions.TimeExhausted,
         exceptions.BadFunctionCallOutput,
         exceptions.ContractLogicError,
@@ -128,14 +130,14 @@ def retry_on_failure(
     return decorator
 
 # ======================================================
-# File & Data Utilities
+# File Utilities
 # ======================================================
-def load_lines(path: Path) -> Set[str]:
+def load_lines(path: Path) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(path)
 
     with path.open("r", encoding="utf-8") as f:
-        data = {line.strip() for line in f if line.strip()}
+        data = [line.strip() for line in f if line.strip()]
 
     logging.info("Loaded %d entries from %s", len(data), path)
     return data
@@ -152,10 +154,11 @@ def load_abi(path: Path) -> List[dict]:
 
 
 def validate_addresses(addresses: Iterable[str]) -> List[str]:
+    w3 = get_web3()
     valid: List[str] = []
     for addr in addresses:
-        if web3.is_address(addr):
-            valid.append(web3.to_checksum_address(addr))
+        if w3.is_address(addr):
+            valid.append(w3.to_checksum_address(addr))
         else:
             logging.warning("Invalid address skipped: %s", addr)
     return valid
@@ -164,14 +167,15 @@ def validate_addresses(addresses: Iterable[str]) -> List[str]:
 # Contract Handling
 # ======================================================
 @lru_cache(maxsize=512)
-def init_contract(address: str, abi_json: Tuple[dict, ...]) -> Contract:
-    return web3.eth.contract(
-        address=web3.to_checksum_address(address),
+def init_contract(address: str, abi_json: tuple[dict, ...]) -> Contract:
+    w3 = get_web3()
+    return w3.eth.contract(
+        address=w3.to_checksum_address(address),
         abi=abi_json,
     )
 
 
-def load_contracts(addresses: Set[str], abi: List[dict]) -> List[Contract]:
+def load_contracts(addresses: Iterable[str], abi: List[dict]) -> List[Contract]:
     abi_tuple = tuple(abi)
     contracts: List[Contract] = []
 
@@ -188,7 +192,7 @@ def load_contracts(addresses: Set[str], abi: List[dict]) -> List[Contract]:
     return contracts
 
 # ======================================================
-# NFT Checking Logic
+# NFT Logic
 # ======================================================
 @retry_on_failure()
 def has_erc721_balance(address: str, contract: Contract) -> bool:
@@ -206,21 +210,13 @@ def check_nft_ownership(
     for contract in contracts:
         if stop_event.is_set():
             break
-        try:
-            if has_erc721_balance(address, contract):
-                logging.info(
-                    "%s owns ERC-721 in contract %s",
-                    address,
-                    contract.address,
-                )
-                return address, True
-        except Exception as exc:
-            logging.debug(
-                "Contract %s failed for %s: %s",
-                contract.address,
+        if has_erc721_balance(address, contract):
+            logging.info(
+                "%s owns ERC-721 in contract %s",
                 address,
-                exc,
+                contract.address,
             )
+            return address, True
 
     return address, False
 
@@ -238,13 +234,10 @@ def append_results(
     df = pd.DataFrame(rows, columns=["address", "owns_nft"])
 
     with lock:
-        df.to_csv(
-            path,
-            mode="a",
-            header=not path.exists(),
-            index=False,
-            encoding="utf-8",
-        )
+        with path.open("a", encoding="utf-8", newline="") as f:
+            df.to_csv(f, header=f.tell() == 0, index=False)
+            f.flush()
+            os.fsync(f.fileno())
 
     logging.info("Flushed %d rows to disk", len(rows))
 
@@ -263,37 +256,29 @@ def main() -> None:
     write_lock = Lock()
 
     def on_sigint(_sig, _frame):
-        logging.warning("SIGINT received — stopping submission")
+        logging.warning("SIGINT received — stopping gracefully")
         stop_event.set()
 
     signal.signal(signal.SIGINT, on_sigint)
 
     logging.info(
-        "Starting check: %d addresses × %d contracts using %d threads",
+        "Starting: %d addresses × %d contracts using %d threads",
         len(addresses),
         len(contracts),
         NUM_THREADS,
     )
 
     buffer: List[Tuple[str, bool]] = []
-    checked = 0
-    owned = 0
+    checked = owned = 0
 
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures: Dict[Future, str] = {}
+        futures: Dict[Future, str] = {
+            executor.submit(check_nft_ownership, addr, contracts, stop_event): addr
+            for addr in addresses
+            if not stop_event.is_set()
+        }
 
-        for addr in addresses:
-            if stop_event.is_set():
-                break
-            futures[
-                executor.submit(check_nft_ownership, addr, contracts, stop_event)
-            ] = addr
-
-        with tqdm(
-            total=len(futures),
-            disable=not SHOW_PROGRESS,
-            unit="addr",
-        ) as pbar:
+        with tqdm(total=len(futures), disable=not SHOW_PROGRESS, unit="addr") as pbar:
             for future in as_completed(futures):
                 if stop_event.is_set():
                     break
@@ -307,8 +292,7 @@ def main() -> None:
 
                 buffer.append((address, owns))
                 checked += 1
-                if owns:
-                    owned += 1
+                owned += int(owns)
 
                 if len(buffer) >= BATCH_SIZE:
                     append_results(buffer, OUTPUT_FILE, write_lock)
