@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-High-performance ERC-721 ownership checker, batch JSON-RPC edition.
+Robust high-throughput ERC-721 ownership checker (JSON-RPC batch edition).
 
-Reads wallet addresses and ERC-721 contract addresses, then checks whether each
-wallet owns at least one NFT from any supplied contract.
+Checks whether every wallet owns at least one token in any supplied ERC-721
+contract by calling balanceOf(address) through batched eth_call requests.
 
-Why this version is faster/safer than a naive balanceOf loop:
-- Uses JSON-RPC batch eth_call instead of one HTTP request per balanceOf.
-- Supports multiple RPC URLs with simple health scoring and cooldowns.
-- Keeps one HTTP session per thread per RPC URL.
-- Bounded in-flight wallet tasks, so huge inputs do not eat RAM.
-- Dedicated CSV writer thread.
-- Separates confirmed false from uncertain failures.
-- Resumable output.
+Key properties:
+- Multiple RPC endpoints with chain-id validation, health scoring and cooldowns.
+- Thread-local keep-alive sessions.
+- Retries HTTP failures and retryable JSON-RPC batch failures.
+- Never converts an incomplete check into a confirmed false by default.
+- Bounded worker queue and dedicated CSV writer.
+- Correct wallet attribution if a worker crashes.
+- Resume support and graceful interruption.
 
-Input files by default:
+Default input files:
 - input_addresses.txt
 - nft_contracts.txt
 
-Output files by default:
+Default output files:
 - nft_owners.csv
 - nft_owners_failed.csv
 """
@@ -40,23 +40,18 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException, Timeout
+from requests.exceptions import RequestException
 from web3 import Web3
 
-BALANCE_OF_SELECTOR = "70a08231"  # balanceOf(address)
+BALANCE_OF_SELECTOR = "70a08231"
 WRITE_SENTINEL = object()
 
-stop_event = threading.Event()
-thread_local = threading.local()
-
-stats_lock = threading.Lock()
-checked_count = 0
-owned_count = 0
-failed_count = 0
+STOP_EVENT = threading.Event()
+THREAD_LOCAL = threading.local()
 
 
 # ==========================================================
@@ -65,7 +60,7 @@ failed_count = 0
 
 @dataclass(frozen=True)
 class Config:
-    rpc_urls: list[str]
+    rpc_urls: tuple[str, ...]
     input_file: Path
     contracts_file: Path
     output_file: Path
@@ -75,14 +70,20 @@ class Config:
     max_inflight: int
     max_retries: int
     base_delay: float
+    max_delay: float
     request_timeout: float
+    connect_timeout: float
     pool_connections: int
     pool_maxsize: int
     contract_batch_size: int
     writer_batch_size: int
+    writer_flush_seconds: float
     progress_every: int
-    min_confirmed_contracts: int
     skip_contract_validation: bool
+    expected_chain_id: Optional[int]
+    allow_partial_false: bool
+    resume_failed: bool
+    user_agent: str
 
 
 @dataclass(frozen=True)
@@ -91,67 +92,130 @@ class CheckResult:
     owns_nft: Optional[bool]
     checked_contracts: int
     failed_contracts: int
+    total_contracts: int
     error: str = ""
+
+
+@dataclass
+class Stats:
+    confirmed: int = 0
+    owners: int = 0
+    uncertain: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def add(self, result: CheckResult) -> tuple[int, int, int, int]:
+        with self.lock:
+            if result.owns_nft is None:
+                self.uncertain += 1
+            else:
+                self.confirmed += 1
+                if result.owns_nft:
+                    self.owners += 1
+            done = self.confirmed + self.uncertain
+            return done, self.confirmed, self.owners, self.uncertain
 
 
 @dataclass
 class RpcNode:
     url: str
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     cooldown_until: float = 0.0
     failures: int = 0
     latency_ema: float = 0.30
     consecutive_throttles: int = 0
+    disabled_reason: str = ""
+    chain_id: Optional[int] = None
+
+    def snapshot(self) -> tuple[float, int, float, int, str]:
+        with self.lock:
+            return (
+                self.cooldown_until,
+                self.failures,
+                self.latency_ema,
+                self.consecutive_throttles,
+                self.disabled_reason,
+            )
 
     def score(self, now: float) -> float:
-        if self.cooldown_until > now:
-            return 10_000 + (self.cooldown_until - now)
-        return self.latency_ema + self.failures * 0.25 + self.consecutive_throttles * 0.50
+        cooldown_until, failures, latency, throttles, disabled = self.snapshot()
+        if disabled:
+            return float("inf")
+        if cooldown_until > now:
+            return 10_000.0 + cooldown_until - now
+        return latency + failures * 0.25 + throttles * 0.50
 
 
 class RpcPool:
-    def __init__(self, urls: list[str]) -> None:
-        self.nodes = [RpcNode(url=u) for u in urls]
+    def __init__(self, urls: Sequence[str]) -> None:
+        if not urls:
+            raise ValueError("RPC URL list is empty")
+        self.nodes = [RpcNode(url=url) for url in urls]
         self._rr = itertools.count()
+        self._rr_lock = threading.Lock()
+
+    def active_nodes(self) -> list[RpcNode]:
+        return [node for node in self.nodes if not node.snapshot()[4]]
 
     def choose(self) -> RpcNode:
-        now = time.time()
-        # Add tiny round-robin jitter to avoid all threads hammering the same best node.
-        offset = next(self._rr) % max(1, len(self.nodes))
-        rotated = self.nodes[offset:] + self.nodes[:offset]
-        return min(rotated, key=lambda n: n.score(now))
+        active = self.active_nodes()
+        if not active:
+            reasons = "; ".join(
+                f"{redact_url(n.url)}: {n.snapshot()[4] or 'unavailable'}" for n in self.nodes
+            )
+            raise RuntimeError(f"No active RPC nodes: {reasons}")
+
+        now = time.monotonic()
+        with self._rr_lock:
+            offset = next(self._rr) % len(active)
+        rotated = active[offset:] + active[:offset]
+        node = min(rotated, key=lambda item: item.score(now))
+
+        cooldown_until = node.snapshot()[0]
+        if cooldown_until > now:
+            STOP_EVENT.wait(min(cooldown_until - now, 1.0))
+            if STOP_EVENT.is_set():
+                raise RuntimeError("stopped")
+        return node
 
     @staticmethod
     def mark_success(node: RpcNode, latency: float) -> None:
         with node.lock:
             node.failures = max(0, node.failures - 1)
             node.consecutive_throttles = 0
+            node.cooldown_until = 0.0
             node.latency_ema = node.latency_ema * 0.85 + latency * 0.15
 
     @staticmethod
     def mark_failure(node: RpcNode, *, throttled: bool) -> None:
+        now = time.monotonic()
         with node.lock:
-            node.failures = min(20, node.failures + 1)
+            node.failures = min(50, node.failures + 1)
             if throttled:
                 node.consecutive_throttles = min(20, node.consecutive_throttles + 1)
-                cooldown = min(30.0, 0.75 * (2 ** min(5, node.consecutive_throttles)))
+                cooldown = min(60.0, 0.75 * (2 ** min(6, node.consecutive_throttles)))
             else:
-                cooldown = min(10.0, 0.25 * node.failures)
-            node.cooldown_until = max(node.cooldown_until, time.time() + cooldown)
+                cooldown = min(15.0, 0.35 * node.failures)
+            node.cooldown_until = max(node.cooldown_until, now + cooldown)
+
+    @staticmethod
+    def disable(node: RpcNode, reason: str) -> None:
+        with node.lock:
+            node.disabled_reason = reason
 
 
 RPC_POOL: RpcPool
-CFG: Config
 
 
 # ==========================================================
 # LOGGING / SIGNALS
 # ==========================================================
 
+
 def setup_logging(log_file: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
         handlers=[
             logging.FileHandler(log_file, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
@@ -162,8 +226,9 @@ def setup_logging(log_file: Path) -> None:
 
 def install_signal_handlers() -> None:
     def handler(signum: int, _frame: object) -> None:
-        logging.warning("Signal %s received; stopping after in-flight tasks...", signum)
-        stop_event.set()
+        if not STOP_EVENT.is_set():
+            logging.warning("Signal %s received; stopping cleanly...", signum)
+            STOP_EVENT.set()
 
     signal.signal(signal.SIGINT, handler)
     if hasattr(signal, "SIGTERM"):
@@ -171,17 +236,64 @@ def install_signal_handlers() -> None:
 
 
 # ==========================================================
+# HELPERS
+# ==========================================================
+
+
+def redact_url(url: str) -> str:
+    try:
+        parsed = requests.utils.urlparse(url)
+        host = parsed.hostname or "unknown"
+        port = f":{parsed.port}" if parsed.port else ""
+        path = parsed.path.rstrip("/")
+        if len(path) > 18:
+            path = path[:8] + "…" + path[-6:]
+        return f"{parsed.scheme}://{host}{port}{path}"
+    except Exception:
+        return "<rpc-url>"
+
+
+def truncate_error(value: Any, limit: int = 500) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return text[:limit]
+
+
+def backoff_delay(base: float, maximum: float, attempt: int) -> float:
+    raw = min(maximum, base * (1.8 ** max(0, attempt - 1)))
+    return raw * random.uniform(0.75, 1.25)
+
+
+def interruptible_sleep(seconds: float) -> None:
+    if seconds > 0:
+        STOP_EVENT.wait(seconds)
+
+
+def chunked(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+# ==========================================================
 # HTTP / JSON-RPC
 # ==========================================================
 
-def get_session(cfg: Config, url: str) -> requests.Session:
-    if not hasattr(thread_local, "sessions"):
-        thread_local.sessions = {}
 
-    sessions: dict[str, requests.Session] = thread_local.sessions
+def get_session(cfg: Config, url: str) -> requests.Session:
+    sessions: dict[str, requests.Session]
+    if not hasattr(THREAD_LOCAL, "sessions"):
+        THREAD_LOCAL.sessions = {}
+    sessions = THREAD_LOCAL.sessions
+
     session = sessions.get(url)
     if session is None:
         session = requests.Session()
+        session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": cfg.user_agent,
+            }
+        )
         adapter = HTTPAdapter(
             pool_connections=cfg.pool_connections,
             pool_maxsize=cfg.pool_maxsize,
@@ -194,6 +306,18 @@ def get_session(cfg: Config, url: str) -> requests.Session:
     return session
 
 
+def close_thread_sessions() -> None:
+    sessions = getattr(THREAD_LOCAL, "sessions", None)
+    if not sessions:
+        return
+    for session in sessions.values():
+        try:
+            session.close()
+        except Exception:
+            pass
+    sessions.clear()
+
+
 def is_throttle_text(text: str) -> bool:
     msg = text.lower()
     return any(
@@ -203,9 +327,11 @@ def is_throttle_text(text: str) -> bool:
             "rate limit",
             "rate-limit",
             "too many requests",
-            "project id request rate exceeded",
+            "request rate exceeded",
             "daily request count exceeded",
             "capacity exceeded",
+            "compute units per second",
+            "cu per second",
         )
     )
 
@@ -216,90 +342,205 @@ def is_retryable_text(text: str) -> bool:
         token in msg
         for token in (
             "timeout",
+            "timed out",
             "temporarily unavailable",
             "connection",
             "server error",
             "bad gateway",
             "gateway timeout",
-            "503",
-            "502",
-            "500",
+            "service unavailable",
+            "internal error",
+            "header not found",
+            "missing trie node",
             "econnreset",
-            "read timed out",
+            "502",
+            "503",
+            "504",
         )
     )
+
+
+def json_rpc_error_text(item: Mapping[str, Any]) -> str:
+    error = item.get("error")
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        message = error.get("message", "")
+        data = error.get("data", "")
+        return truncate_error(f"RPC {code}: {message} {data}".strip())
+    return truncate_error(error)
+
+
+def should_retry_batch_response(data: list[dict[str, Any]], expected_count: int) -> tuple[bool, str]:
+    if not data:
+        return True, "empty JSON-RPC batch response"
+
+    errors = [json_rpc_error_text(item) for item in data if isinstance(item, dict) and "error" in item]
+    if len(errors) == expected_count and errors:
+        combined = " | ".join(errors[:3])
+        return is_retryable_text(combined), combined
+    return False, ""
+
+
+def rpc_request_to_node(
+    cfg: Config,
+    node: RpcNode,
+    payload: dict[str, Any] | list[dict[str, Any]],
+    *,
+    expect_batch: bool,
+) -> dict[str, Any] | list[dict[str, Any]]:
+    session = get_session(cfg, node.url)
+    started = time.monotonic()
+    response = session.post(
+        node.url,
+        json=payload,
+        timeout=(cfg.connect_timeout, cfg.request_timeout),
+    )
+    latency = time.monotonic() - started
+
+    if response.status_code != 200:
+        body = truncate_error(response.text)
+        raise RuntimeError(f"HTTP {response.status_code}: {body}")
+
+    try:
+        data = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid JSON response: {truncate_error(response.text)}") from exc
+
+    if expect_batch and not isinstance(data, list):
+        raise RuntimeError(f"RPC returned non-batch response: {truncate_error(data)}")
+    if not expect_batch and not isinstance(data, dict):
+        raise RuntimeError(f"RPC returned invalid single response: {truncate_error(data)}")
+
+    RPC_POOL.mark_success(node, latency)
+    return data
 
 
 def rpc_batch(cfg: Config, payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not payload:
         return []
 
-    delay = cfg.base_delay
     last_error = "unknown RPC error"
+    attempted_nodes: set[str] = set()
 
     for attempt in range(1, cfg.max_retries + 1):
-        if stop_event.is_set():
+        if STOP_EVENT.is_set():
             raise RuntimeError("stopped")
 
         node = RPC_POOL.choose()
-        session = get_session(cfg, node.url)
-        started = time.time()
+        attempted_nodes.add(node.url)
 
         try:
-            response = session.post(node.url, json=payload, timeout=cfg.request_timeout)
-            latency = time.time() - started
+            raw = rpc_request_to_node(cfg, node, payload, expect_batch=True)
+            assert isinstance(raw, list)
+            data = [item for item in raw if isinstance(item, dict)]
 
-            if response.status_code != 200:
-                body = response.text[:500]
-                last_error = f"HTTP {response.status_code}: {body}"
-                throttled = response.status_code == 429 or is_throttle_text(body)
-                RPC_POOL.mark_failure(node, throttled=throttled)
-                raise RuntimeError(last_error)
-
-            data = response.json()
-            if not isinstance(data, list):
-                last_error = f"RPC returned non-batch response: {str(data)[:500]}"
-                RPC_POOL.mark_failure(node, throttled=is_throttle_text(last_error))
-                raise RuntimeError(last_error)
-
-            RPC_POOL.mark_success(node, latency)
+            retry, batch_error = should_retry_batch_response(data, len(payload))
+            if retry:
+                raise RuntimeError(batch_error)
             return data
 
-        except (RequestException, Timeout, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = str(exc)[:500]
+        except (RequestException, RuntimeError) as exc:
+            last_error = truncate_error(exc)
             throttled = is_throttle_text(last_error)
             RPC_POOL.mark_failure(node, throttled=throttled)
 
             if attempt >= cfg.max_retries or not is_retryable_text(last_error):
-                raise RuntimeError(last_error) from exc
+                break
 
-            time.sleep(delay * (1.0 + random.random() * 0.45))
-            delay *= 1.7
+            logging.debug(
+                "RPC batch retry %d/%d after %s from %s",
+                attempt,
+                cfg.max_retries,
+                last_error,
+                redact_url(node.url),
+            )
+            interruptible_sleep(backoff_delay(cfg.base_delay, cfg.max_delay, attempt))
 
-    raise RuntimeError(last_error)
+    nodes = ", ".join(redact_url(url) for url in attempted_nodes)
+    raise RuntimeError(f"{last_error}; attempted RPC nodes: {nodes}")
+
+
+def rpc_single(cfg: Config, node: RpcNode, method: str, params: list[Any]) -> dict[str, Any]:
+    payload = make_rpc_call(1, method, params)
+    raw = rpc_request_to_node(cfg, node, payload, expect_batch=False)
+    assert isinstance(raw, dict)
+    return raw
 
 
 def make_rpc_call(call_id: int, method: str, params: list[Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": call_id, "method": method, "params": params}
 
 
-def response_by_id(responses: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+def response_by_id(responses: Iterable[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     mapped: dict[int, dict[str, Any]] = {}
     for item in responses:
         try:
-            mapped[int(item.get("id"))] = item
-        except Exception:
+            call_id = item.get("id")
+            if isinstance(call_id, bool) or call_id is None:
+                continue
+            mapped[int(call_id)] = item
+        except (TypeError, ValueError):
             continue
     return mapped
+
+
+def validate_rpc_nodes(cfg: Config) -> int:
+    logging.info("Validating %d RPC node(s)...", len(RPC_POOL.nodes))
+    detected_chain_ids: list[int] = []
+
+    for node in RPC_POOL.nodes:
+        try:
+            response = rpc_single(cfg, node, "eth_chainId", [])
+            if "error" in response:
+                raise RuntimeError(json_rpc_error_text(response))
+            raw_chain_id = response.get("result")
+            if not isinstance(raw_chain_id, str):
+                raise RuntimeError(f"bad eth_chainId result: {raw_chain_id!r}")
+            chain_id = int(raw_chain_id, 16)
+            node.chain_id = chain_id
+            detected_chain_ids.append(chain_id)
+            logging.info("RPC OK: %s | chain_id=%d", redact_url(node.url), chain_id)
+        except Exception as exc:
+            reason = f"health check failed: {truncate_error(exc)}"
+            RPC_POOL.disable(node, reason)
+            logging.warning("RPC disabled: %s | %s", redact_url(node.url), reason)
+
+    if not detected_chain_ids:
+        raise RuntimeError("All RPC nodes failed health validation")
+
+    target_chain_id = cfg.expected_chain_id
+    if target_chain_id is None:
+        counts: dict[int, int] = {}
+        for chain_id in detected_chain_ids:
+            counts[chain_id] = counts.get(chain_id, 0) + 1
+        target_chain_id = max(counts, key=counts.get)
+
+    for node in RPC_POOL.active_nodes():
+        if node.chain_id != target_chain_id:
+            reason = f"wrong chain_id={node.chain_id}; expected {target_chain_id}"
+            RPC_POOL.disable(node, reason)
+            logging.warning("RPC disabled: %s | %s", redact_url(node.url), reason)
+
+    if not RPC_POOL.active_nodes():
+        raise RuntimeError(f"No RPC nodes remain for chain_id={target_chain_id}")
+
+    logging.info(
+        "RPC pool ready: active=%d/%d | chain_id=%d",
+        len(RPC_POOL.active_nodes()),
+        len(RPC_POOL.nodes),
+        target_chain_id,
+    )
+    return target_chain_id
 
 
 # ==========================================================
 # INPUT / CSV
 # ==========================================================
 
+
 def iter_clean_lines(path: Path) -> Iterator[str]:
-    with path.open("r", encoding="utf-8") as f:
-        for raw in f:
+    with path.open("r", encoding="utf-8-sig") as file:
+        for raw in file:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -307,68 +548,75 @@ def iter_clean_lines(path: Path) -> Iterator[str]:
 
 
 def unique_preserve_order(items: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
+    return list(dict.fromkeys(items))
+
+
+def extract_first_token(line: str) -> str:
+    for delimiter in (",", ";", "\t", " "):
+        if delimiter in line:
+            line = line.split(delimiter, 1)[0]
+    return line.strip().strip('"').strip("'")
 
 
 def validate_addresses(items: Iterable[str], *, label: str) -> list[str]:
     valid: list[str] = []
-    invalid = 0
+    invalid_samples: list[str] = []
+    invalid_count = 0
 
     for item in items:
-        # Allow comma/semicolon separated accidental exports: take the first token.
-        token = item.replace(";", ",").split(",", 1)[0].strip()
+        token = extract_first_token(item)
         if Web3.is_address(token):
             valid.append(Web3.to_checksum_address(token))
         else:
-            invalid += 1
+            invalid_count += 1
+            if len(invalid_samples) < 5:
+                invalid_samples.append(token)
 
-    valid = unique_preserve_order(valid)
-    if invalid:
-        logging.warning("Skipped invalid %s line(s): %d", label, invalid)
-    return valid
+    deduplicated = unique_preserve_order(valid)
+    if invalid_count:
+        logging.warning(
+            "Skipped invalid %s line(s): %d | samples: %s",
+            label,
+            invalid_count,
+            ", ".join(invalid_samples),
+        )
+    if len(valid) != len(deduplicated):
+        logging.info("Removed %d duplicate %s line(s)", len(valid) - len(deduplicated), label)
+    return deduplicated
 
 
-def ensure_csv_header(path: Path, header: list[str]) -> None:
+def ensure_csv_header(path: Path, header: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0:
         return
-    with path.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerow(header)
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        csv.writer(file).writerow(header)
 
 
-def load_completed(output_file: Path) -> set[str]:
-    if not output_file.exists() or output_file.stat().st_size == 0:
+def load_addresses_from_csv(path: Path) -> set[str]:
+    if not path.exists() or path.stat().st_size == 0:
         return set()
 
     completed: set[str] = set()
-    with output_file.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        address_col = header.index("address") if header and "address" in header else 0
-
-        for row in reader:
-            if len(row) <= address_col:
-                continue
-            address = row[address_col].strip()
-            if Web3.is_address(address):
-                completed.add(Web3.to_checksum_address(address))
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            if not reader.fieldnames or "address" not in reader.fieldnames:
+                logging.warning("Cannot resume from %s: missing address column", path)
+                return set()
+            for row in reader:
+                address = (row.get("address") or "").strip()
+                if Web3.is_address(address):
+                    completed.add(Web3.to_checksum_address(address))
+    except (OSError, csv.Error) as exc:
+        logging.warning("Cannot read resume file %s: %s", path, exc)
     return completed
-
-
-def chunked(items: list[str], size: int) -> Iterator[list[str]]:
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
 
 
 # ==========================================================
 # CONTRACT / BALANCE LOGIC
 # ==========================================================
+
 
 def balance_of_calldata(wallet: str) -> str:
     clean = wallet.lower().removeprefix("0x")
@@ -378,9 +626,12 @@ def balance_of_calldata(wallet: str) -> str:
 def parse_uint256_hex(value: Any) -> int:
     if not isinstance(value, str) or not value.startswith("0x"):
         raise ValueError(f"bad hex result: {value!r}")
-    if value == "0x":
+    if value in ("0x", "0x0"):
         return 0
-    return int(value, 16)
+    number = int(value, 16)
+    if number < 0 or number >= 2**256:
+        raise ValueError("uint256 result is out of range")
+    return number
 
 
 def filter_contracts(cfg: Config, contracts: list[str]) -> list[str]:
@@ -389,201 +640,249 @@ def filter_contracts(cfg: Config, contracts: list[str]) -> list[str]:
         return contracts
 
     valid: list[str] = []
+    uncertain: list[str] = []
     logging.info("Checking contract bytecode: %d candidate(s)", len(contracts))
 
     for batch in chunked(contracts, cfg.contract_batch_size):
-        payload = [make_rpc_call(i, "eth_getCode", [addr, "latest"]) for i, addr in enumerate(batch)]
+        payload = [make_rpc_call(i, "eth_getCode", [address, "latest"]) for i, address in enumerate(batch)]
         try:
             responses = response_by_id(rpc_batch(cfg, payload))
         except Exception as exc:
-            logging.warning("Contract validation batch failed; keeping batch as uncertain-valid: %s", exc)
-            valid.extend(batch)
+            logging.warning("Contract validation batch failed; keeping %d uncertain contract(s): %s", len(batch), exc)
+            uncertain.extend(batch)
             continue
 
-        for i, addr in enumerate(batch):
+        for i, address in enumerate(batch):
             item = responses.get(i)
             if not item:
-                logging.warning("No eth_getCode response for %s; keeping as uncertain-valid", addr)
-                valid.append(addr)
+                uncertain.append(address)
+                logging.warning("No eth_getCode response for %s; keeping it", address)
                 continue
             if "error" in item:
-                logging.warning("eth_getCode error for %s; keeping as uncertain-valid: %s", addr, item["error"])
-                valid.append(addr)
+                uncertain.append(address)
+                logging.warning("eth_getCode error for %s; keeping it: %s", address, json_rpc_error_text(item))
                 continue
             code = item.get("result")
-            if isinstance(code, str) and code not in ("0x", "0x0"):
-                valid.append(addr)
+            if isinstance(code, str) and code.lower() not in ("0x", "0x0", "0x00"):
+                valid.append(address)
             else:
-                logging.warning("Not a contract, skipped: %s", addr)
+                logging.warning("EOA/empty address skipped from contract list: %s", address)
 
-    valid = unique_preserve_order(valid)
-    logging.info("Verified/kept contracts: %d/%d", len(valid), len(contracts))
-    return valid
+    result = unique_preserve_order(valid + uncertain)
+    logging.info(
+        "Contract validation done: usable=%d/%d | verified=%d | uncertain=%d",
+        len(result),
+        len(contracts),
+        len(valid),
+        len(uncertain),
+    )
+    return result
 
 
-def check_wallet(cfg: Config, wallet: str, contracts: list[str]) -> CheckResult:
+def check_wallet(cfg: Config, wallet: str, contracts: Sequence[str]) -> CheckResult:
     checked = 0
     failed = 0
-    first_error = ""
+    errors: list[str] = []
     calldata = balance_of_calldata(wallet)
 
-    for batch in chunked(contracts, cfg.contract_batch_size):
-        if stop_event.is_set():
-            return CheckResult(wallet, None, checked, failed, "stopped")
+    try:
+        for batch in chunked(contracts, cfg.contract_batch_size):
+            if STOP_EVENT.is_set():
+                return CheckResult(wallet, None, checked, failed, len(contracts), "stopped")
 
-        payload = [
-            make_rpc_call(
-                i,
-                "eth_call",
-                [{"to": contract, "data": calldata}, "latest"],
-            )
-            for i, contract in enumerate(batch)
-        ]
-
-        try:
-            responses = response_by_id(rpc_batch(cfg, payload))
-        except Exception as exc:
-            failed += len(batch)
-            if not first_error:
-                first_error = str(exc)[:500]
-            continue
-
-        # If the provider returned rate-limit style errors inside every response, retrying
-        # the whole request would have happened at HTTP level. Here we mark individual
-        # contract calls as failed instead of silently treating them as zero balances.
-        for i, _contract in enumerate(batch):
-            item = responses.get(i)
-            if not item:
-                failed += 1
-                if not first_error:
-                    first_error = "missing RPC response item"
-                continue
-
-            if "error" in item:
-                failed += 1
-                if not first_error:
-                    first_error = str(item["error"])[:500]
-                continue
+            payload = [
+                make_rpc_call(i, "eth_call", [{"to": contract, "data": calldata}, "latest"])
+                for i, contract in enumerate(batch)
+            ]
 
             try:
-                balance = parse_uint256_hex(item.get("result"))
+                responses = response_by_id(rpc_batch(cfg, payload))
             except Exception as exc:
-                failed += 1
-                if not first_error:
-                    first_error = str(exc)[:500]
+                failed += len(batch)
+                if len(errors) < 3:
+                    errors.append(truncate_error(exc))
                 continue
 
-            checked += 1
-            if balance > 0:
-                return CheckResult(wallet, True, checked, failed, "")
+            for i, contract in enumerate(batch):
+                item = responses.get(i)
+                if not item:
+                    failed += 1
+                    if len(errors) < 3:
+                        errors.append(f"{contract}: missing RPC response")
+                    continue
 
-    if checked < cfg.min_confirmed_contracts and failed > 0:
-        return CheckResult(wallet, None, checked, failed, first_error or "too few confirmed checks")
+                if "error" in item:
+                    failed += 1
+                    if len(errors) < 3:
+                        errors.append(f"{contract}: {json_rpc_error_text(item)}")
+                    continue
 
-    if checked == 0 and failed > 0:
-        return CheckResult(wallet, None, checked, failed, first_error or "all checks failed")
+                try:
+                    balance = parse_uint256_hex(item.get("result"))
+                except (TypeError, ValueError) as exc:
+                    failed += 1
+                    if len(errors) < 3:
+                        errors.append(f"{contract}: {truncate_error(exc)}")
+                    continue
 
-    return CheckResult(wallet, False, checked, failed, first_error if failed else "")
+                checked += 1
+                if balance > 0:
+                    return CheckResult(wallet, True, checked, failed, len(contracts))
+
+        error_text = " | ".join(errors)
+        if failed and not cfg.allow_partial_false:
+            return CheckResult(wallet, None, checked, failed, len(contracts), error_text or "incomplete check")
+
+        if checked == 0:
+            return CheckResult(wallet, None, checked, failed, len(contracts), error_text or "no confirmed checks")
+
+        return CheckResult(wallet, False, checked, failed, len(contracts), error_text)
+    finally:
+        # Sessions stay alive for the worker thread and are closed when the pool exits.
+        pass
 
 
 # ==========================================================
 # WRITER / PROGRESS
 # ==========================================================
 
-def writer_loop(cfg: Config, q: "queue.Queue[CheckResult | object]") -> None:
-    ensure_csv_header(cfg.output_file, ["address", "owns_nft", "checked_contracts", "failed_contracts"])
-    ensure_csv_header(cfg.failed_file, ["address", "checked_contracts", "failed_contracts", "error"])
 
-    ok_buffer: list[list[object]] = []
-    failed_buffer: list[list[object]] = []
-
-    def flush() -> None:
-        nonlocal ok_buffer, failed_buffer
-        if ok_buffer:
-            with cfg.output_file.open("a", encoding="utf-8", newline="") as f:
-                csv.writer(f).writerows(ok_buffer)
-            ok_buffer = []
-        if failed_buffer:
-            with cfg.failed_file.open("a", encoding="utf-8", newline="") as f:
-                csv.writer(f).writerows(failed_buffer)
-            failed_buffer = []
-
-    while True:
-        item = q.get()
-        try:
-            if item is WRITE_SENTINEL:
-                flush()
-                return
-
-            assert isinstance(item, CheckResult)
-            if item.owns_nft is None:
-                failed_buffer.append([item.address, item.checked_contracts, item.failed_contracts, item.error])
-            else:
-                ok_buffer.append([item.address, str(item.owns_nft).lower(), item.checked_contracts, item.failed_contracts])
-
-            if len(ok_buffer) + len(failed_buffer) >= cfg.writer_batch_size:
-                flush()
-        finally:
-            q.task_done()
+def append_csv_rows(path: Path, rows: list[list[object]]) -> None:
+    if not rows:
+        return
+    with path.open("a", encoding="utf-8-sig", newline="") as file:
+        csv.writer(file).writerows(rows)
+        file.flush()
 
 
-def handle_result(result: CheckResult, q: "queue.Queue[CheckResult | object]", total: int, start: float) -> None:
-    global checked_count, owned_count, failed_count
-
-    q.put(result)
-
-    with stats_lock:
-        if result.owns_nft is None:
-            failed_count += 1
-        else:
-            checked_count += 1
-            owned_count += int(result.owns_nft)
-
-        done = checked_count + failed_count
-        checked = checked_count
-        owners = owned_count
-        failed = failed_count
-
-    if done % cfg_progress_every() == 0 or done == total:
-        elapsed = max(0.001, time.time() - start)
-        speed = done / elapsed
-        eta = (total - done) / speed if speed else 0.0
-        logging.info(
-            "Progress %d/%d (%.2f%%) | %.1f wallet/s | checked=%d | owners=%d | failed=%d | ETA %.1fs",
-            done,
-            total,
-            done / total * 100,
-            speed,
-            checked,
-            owners,
-            failed,
-            eta,
+def writer_loop(cfg: Config, work_queue: "queue.Queue[CheckResult | object]", error_box: list[BaseException]) -> None:
+    try:
+        ensure_csv_header(
+            cfg.output_file,
+            ["address", "owns_nft", "checked_contracts", "failed_contracts", "total_contracts"],
+        )
+        ensure_csv_header(
+            cfg.failed_file,
+            ["address", "checked_contracts", "failed_contracts", "total_contracts", "error"],
         )
 
+        ok_buffer: list[list[object]] = []
+        failed_buffer: list[list[object]] = []
+        last_flush = time.monotonic()
 
-def cfg_progress_every() -> int:
-    return max(1, CFG.progress_every)
+        def flush() -> None:
+            nonlocal ok_buffer, failed_buffer, last_flush
+            append_csv_rows(cfg.output_file, ok_buffer)
+            append_csv_rows(cfg.failed_file, failed_buffer)
+            ok_buffer = []
+            failed_buffer = []
+            last_flush = time.monotonic()
+
+        while True:
+            timeout = max(0.1, cfg.writer_flush_seconds - (time.monotonic() - last_flush))
+            try:
+                item = work_queue.get(timeout=timeout)
+            except queue.Empty:
+                flush()
+                continue
+
+            try:
+                if item is WRITE_SENTINEL:
+                    flush()
+                    return
+
+                if not isinstance(item, CheckResult):
+                    raise TypeError(f"unexpected writer item: {type(item)!r}")
+
+                if item.owns_nft is None:
+                    failed_buffer.append(
+                        [item.address, item.checked_contracts, item.failed_contracts, item.total_contracts, item.error]
+                    )
+                else:
+                    ok_buffer.append(
+                        [
+                            item.address,
+                            str(item.owns_nft).lower(),
+                            item.checked_contracts,
+                            item.failed_contracts,
+                            item.total_contracts,
+                        ]
+                    )
+
+                if len(ok_buffer) + len(failed_buffer) >= cfg.writer_batch_size:
+                    flush()
+            finally:
+                work_queue.task_done()
+    except BaseException as exc:  # writer failure must be visible to main thread
+        error_box.append(exc)
+        STOP_EVENT.set()
+        logging.exception("CSV writer crashed")
+
+
+def log_progress(
+    cfg: Config,
+    stats: Stats,
+    result: CheckResult,
+    work_queue: "queue.Queue[CheckResult | object]",
+    total: int,
+    started: float,
+) -> None:
+    work_queue.put(result)
+    done, confirmed, owners, uncertain = stats.add(result)
+
+    if done % cfg.progress_every != 0 and done != total:
+        return
+
+    elapsed = max(0.001, time.monotonic() - started)
+    speed = done / elapsed
+    eta = max(0.0, (total - done) / speed) if speed else 0.0
+    logging.info(
+        "Progress %d/%d (%.2f%%) | %.1f wallet/s | confirmed=%d | owners=%d | uncertain=%d | ETA %.1fs",
+        done,
+        total,
+        done / total * 100,
+        speed,
+        confirmed,
+        owners,
+        uncertain,
+        eta,
+    )
 
 
 # ==========================================================
 # ARGUMENTS / MAIN
 # ==========================================================
 
-def parse_rpc_urls(raw_values: list[str]) -> list[str]:
+
+def parse_rpc_urls(raw_values: Iterable[str]) -> tuple[str, ...]:
     urls: list[str] = []
     for raw in raw_values:
-        for part in raw.split(","):
+        for part in raw.replace(";", ",").split(","):
             url = part.strip()
-            if url:
+            if url and url.lower() not in {"none", "null", "changeme", "your_rpc_url"}:
                 urls.append(url)
-    return unique_preserve_order(urls)
+    return tuple(unique_preserve_order(urls))
 
 
-def parse_args() -> Config:
-    default_rpc = os.getenv("RPC_URLS", "").strip() or os.getenv("INFURA_URL", "").strip()
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-    parser = argparse.ArgumentParser(description="Batch ERC-721 ownership checker")
-    parser.add_argument("--rpc-url", action="append", default=[default_rpc] if default_rpc else [], help="RPC URL. Can be repeated or comma-separated. Env: RPC_URLS or INFURA_URL")
+
+def parse_optional_int(value: str) -> Optional[int]:
+    value = value.strip()
+    if not value:
+        return None
+    return int(value, 0)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
+    env_rpc = os.getenv("RPC_URLS", "").strip() or os.getenv("RPC_URL", "").strip() or os.getenv("INFURA_URL", "").strip()
+
+    parser = argparse.ArgumentParser(description="Robust batch ERC-721 ownership checker")
+    parser.add_argument("--rpc-url", action="append", default=[env_rpc] if env_rpc else [], help="Repeatable or comma-separated RPC URL")
     parser.add_argument("--input", default=os.getenv("INPUT_FILE", "input_addresses.txt"))
     parser.add_argument("--contracts", default=os.getenv("CONTRACTS_FILE", "nft_contracts.txt"))
     parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", "nft_owners.csv"))
@@ -593,22 +892,33 @@ def parse_args() -> Config:
     parser.add_argument("--max-inflight", type=int, default=int(os.getenv("MAX_INFLIGHT", "0")))
     parser.add_argument("--max-retries", type=int, default=int(os.getenv("MAX_RETRIES", "5")))
     parser.add_argument("--base-delay", type=float, default=float(os.getenv("BASE_DELAY", "0.25")))
+    parser.add_argument("--max-delay", type=float, default=float(os.getenv("MAX_DELAY", "10")))
     parser.add_argument("--request-timeout", type=float, default=float(os.getenv("RPC_TIMEOUT", "20")))
-    parser.add_argument("--pool-connections", type=int, default=int(os.getenv("POOL_CONNECTIONS", "128")))
-    parser.add_argument("--pool-maxsize", type=int, default=int(os.getenv("POOL_MAXSIZE", "128")))
+    parser.add_argument("--connect-timeout", type=float, default=float(os.getenv("CONNECT_TIMEOUT", "5")))
+    parser.add_argument("--pool-connections", type=int, default=int(os.getenv("POOL_CONNECTIONS", "64")))
+    parser.add_argument("--pool-maxsize", type=int, default=int(os.getenv("POOL_MAXSIZE", "64")))
     parser.add_argument("--contract-batch-size", type=int, default=int(os.getenv("CONTRACT_BATCH_SIZE", "80")))
-    parser.add_argument("--writer-batch-size", type=int, default=int(os.getenv("WRITER_BATCH_SIZE", os.getenv("BATCH_SIZE", "500"))))
+    parser.add_argument("--writer-batch-size", type=int, default=int(os.getenv("WRITER_BATCH_SIZE", os.getenv("BATCH_SIZE", "250"))))
+    parser.add_argument("--writer-flush-seconds", type=float, default=float(os.getenv("WRITER_FLUSH_SECONDS", "2")))
     parser.add_argument("--progress-every", type=int, default=int(os.getenv("PROGRESS_EVERY", "200")))
-    parser.add_argument("--min-confirmed-contracts", type=int, default=int(os.getenv("MIN_CONFIRMED_CONTRACTS", "1")))
-    parser.add_argument("--skip-contract-validation", action="store_true", default=os.getenv("SKIP_CONTRACT_VALIDATION", "0") == "1")
-    args = parser.parse_args()
+    parser.add_argument("--expected-chain-id", default=os.getenv("EXPECTED_CHAIN_ID", ""), help="Decimal or 0x-prefixed chain id")
+    parser.add_argument("--skip-contract-validation", action="store_true", default=env_bool("SKIP_CONTRACT_VALIDATION"))
+    parser.add_argument("--allow-partial-false", action="store_true", default=env_bool("ALLOW_PARTIAL_FALSE"), help="Unsafe: allow false even if some calls failed")
+    parser.add_argument("--resume-failed", action="store_true", default=env_bool("RESUME_FAILED"), help="Skip addresses already present in failed CSV")
+    parser.add_argument("--user-agent", default=os.getenv("USER_AGENT", "erc721-ownership-checker/2.0"))
+    args = parser.parse_args(argv)
 
     rpc_urls = parse_rpc_urls(args.rpc_url)
     if not rpc_urls:
-        raise EnvironmentError("RPC URL is empty. Set RPC_URLS/INFURA_URL or pass --rpc-url")
+        parser.error("RPC URL is empty. Set RPC_URLS/RPC_URL/INFURA_URL or pass --rpc-url")
 
     threads = max(1, args.threads)
     max_inflight = args.max_inflight if args.max_inflight > 0 else threads * 4
+
+    if args.output == args.failed:
+        parser.error("--output and --failed must point to different files")
+    if args.contract_batch_size > 1000:
+        logging.warning("Very large RPC batches may be rejected by providers")
 
     return Config(
         rpc_urls=rpc_urls,
@@ -621,125 +931,195 @@ def parse_args() -> Config:
         max_inflight=max(1, max_inflight),
         max_retries=max(1, args.max_retries),
         base_delay=max(0.0, args.base_delay),
-        request_timeout=max(1.0, args.request_timeout),
+        max_delay=max(0.0, args.max_delay),
+        request_timeout=max(0.1, args.request_timeout),
+        connect_timeout=max(0.1, args.connect_timeout),
         pool_connections=max(1, args.pool_connections),
         pool_maxsize=max(1, args.pool_maxsize),
         contract_batch_size=max(1, args.contract_batch_size),
         writer_batch_size=max(1, args.writer_batch_size),
+        writer_flush_seconds=max(0.1, args.writer_flush_seconds),
         progress_every=max(1, args.progress_every),
-        min_confirmed_contracts=max(0, args.min_confirmed_contracts),
         skip_contract_validation=bool(args.skip_contract_validation),
+        expected_chain_id=parse_optional_int(args.expected_chain_id),
+        allow_partial_false=bool(args.allow_partial_false),
+        resume_failed=bool(args.resume_failed),
+        user_agent=str(args.user_agent),
     )
 
 
-def main() -> None:
-    global CFG, RPC_POOL
+def validate_paths(cfg: Config) -> None:
+    if not cfg.input_file.is_file():
+        raise FileNotFoundError(f"Input file not found: {cfg.input_file}")
+    if not cfg.contracts_file.is_file():
+        raise FileNotFoundError(f"Contracts file not found: {cfg.contracts_file}")
 
-    CFG = parse_args()
-    RPC_POOL = RpcPool(CFG.rpc_urls)
-    setup_logging(CFG.log_file)
+    resolved_outputs = {cfg.output_file.resolve(), cfg.failed_file.resolve(), cfg.log_file.resolve()}
+    if cfg.input_file.resolve() in resolved_outputs or cfg.contracts_file.resolve() in resolved_outputs:
+        raise ValueError("Input/contract file must not be reused as output or log file")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    global RPC_POOL
+
+    cfg = parse_args(argv)
+    setup_logging(cfg.log_file)
     install_signal_handlers()
+    validate_paths(cfg)
+    RPC_POOL = RpcPool(cfg.rpc_urls)
 
-    if not CFG.input_file.exists():
-        raise FileNotFoundError(f"Input file not found: {CFG.input_file}")
-    if not CFG.contracts_file.exists():
-        raise FileNotFoundError(f"Contracts file not found: {CFG.contracts_file}")
+    chain_id = validate_rpc_nodes(cfg)
 
-    addresses = validate_addresses(iter_clean_lines(CFG.input_file), label="wallet address")
-    contracts = validate_addresses(iter_clean_lines(CFG.contracts_file), label="contract address")
+    addresses = validate_addresses(iter_clean_lines(cfg.input_file), label="wallet address")
+    contracts = validate_addresses(iter_clean_lines(cfg.contracts_file), label="contract address")
 
     if not addresses:
-        logging.info("No valid wallet addresses found.")
-        return
+        logging.info("No valid wallet addresses found")
+        return 0
     if not contracts:
-        logging.info("No valid contract addresses found.")
-        return
+        logging.info("No valid contract addresses found")
+        return 0
 
-    completed = load_completed(CFG.output_file)
+    completed = load_addresses_from_csv(cfg.output_file)
+    if cfg.resume_failed:
+        completed |= load_addresses_from_csv(cfg.failed_file)
+
     if completed:
         before = len(addresses)
-        addresses = [a for a in addresses if a not in completed]
+        addresses = [address for address in addresses if address not in completed]
         logging.info("Resume mode: skipped %d completed wallet(s)", before - len(addresses))
 
     if not addresses:
-        logging.info("Nothing to do.")
-        return
+        logging.info("Nothing to do")
+        return 0
 
-    contracts = filter_contracts(CFG, contracts)
+    contracts = filter_contracts(cfg, contracts)
     if not contracts:
-        raise RuntimeError("No usable contract addresses left. Check RPC/network/contract list.")
+        raise RuntimeError("No usable contract addresses remain")
 
     logging.info(
-        "Start | wallets=%d | contracts=%d | rpc_nodes=%d | threads=%d | max_inflight=%d | contract_batch_size=%d",
+        "Start | chain_id=%d | wallets=%d | contracts=%d | rpc_nodes=%d | threads=%d | max_inflight=%d | batch=%d",
+        chain_id,
         len(addresses),
         len(contracts),
-        len(CFG.rpc_urls),
-        CFG.threads,
-        CFG.max_inflight,
-        CFG.contract_batch_size,
+        len(RPC_POOL.active_nodes()),
+        cfg.threads,
+        cfg.max_inflight,
+        cfg.contract_batch_size,
     )
+    if cfg.allow_partial_false:
+        logging.warning("ALLOW_PARTIAL_FALSE is enabled: incomplete checks may be written as false")
 
-    start = time.time()
+    started = time.monotonic()
     total = len(addresses)
-    write_queue: "queue.Queue[CheckResult | object]" = queue.Queue(maxsize=CFG.writer_batch_size * 4)
-    writer = threading.Thread(target=writer_loop, args=(CFG, write_queue), name="csv-writer", daemon=True)
+    stats = Stats()
+    write_queue: "queue.Queue[CheckResult | object]" = queue.Queue(maxsize=max(4, cfg.writer_batch_size * 4))
+    writer_errors: list[BaseException] = []
+    writer = threading.Thread(
+        target=writer_loop,
+        args=(cfg, write_queue, writer_errors),
+        name="csv-writer",
+        daemon=False,
+    )
     writer.start()
 
     address_iter = iter(addresses)
-    pending: set[Future[CheckResult]] = set()
+    pending: dict[Future[CheckResult], str] = {}
 
     def submit_next(executor: ThreadPoolExecutor) -> bool:
+        if STOP_EVENT.is_set():
+            return False
         try:
             wallet = next(address_iter)
         except StopIteration:
             return False
-        pending.add(executor.submit(check_wallet, CFG, wallet, contracts))
+        future = executor.submit(check_wallet, cfg, wallet, contracts)
+        pending[future] = wallet
         return True
 
     try:
-        with ThreadPoolExecutor(max_workers=CFG.threads) as executor:
-            while len(pending) < min(CFG.max_inflight, total):
-                if not submit_next(executor):
-                    break
+        with ThreadPoolExecutor(max_workers=cfg.threads, thread_name_prefix="wallet") as executor:
+            while len(pending) < min(cfg.max_inflight, total) and submit_next(executor):
+                pass
 
             while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                if writer_errors:
+                    raise RuntimeError("CSV writer failed") from writer_errors[0]
+
+                done, _ = wait(tuple(pending), timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    if STOP_EVENT.is_set():
+                        for future in pending:
+                            future.cancel()
+                    continue
+
                 for future in done:
+                    wallet = pending.pop(future)
                     try:
                         result = future.result()
-                    except Exception as exc:  # noqa: BLE001
-                        logging.exception("Worker crashed: %s", exc)
-                        result = CheckResult("", None, 0, 0, f"worker_crashed:{str(exc)[:500]}")
-                    handle_result(result, write_queue, total, start)
+                    except Exception as exc:  # defensive boundary
+                        logging.exception("Worker crashed for %s", wallet)
+                        result = CheckResult(wallet, None, 0, len(contracts), len(contracts), f"worker_crashed: {truncate_error(exc)}")
 
-                    if not stop_event.is_set():
-                        submit_next(executor)
+                    log_progress(cfg, stats, result, write_queue, total, started)
+                    submit_next(executor)
+
+                if STOP_EVENT.is_set():
+                    for future in pending:
+                        future.cancel()
     finally:
-        write_queue.put(WRITE_SENTINEL)
-        write_queue.join()
+        # Sentinel is queued only after all produced rows, preserving write order.
+        while writer.is_alive():
+            try:
+                write_queue.put(WRITE_SENTINEL, timeout=0.5)
+                break
+            except queue.Full:
+                if writer_errors:
+                    break
         writer.join(timeout=30)
+        if writer.is_alive():
+            logging.error("CSV writer did not stop within 30 seconds")
+        close_thread_sessions()
 
-    elapsed = max(0.001, time.time() - start)
-    done = checked_count + failed_count
+    if writer_errors:
+        raise RuntimeError("CSV writer failed") from writer_errors[0]
+
+    elapsed = max(0.001, time.monotonic() - started)
+    with stats.lock:
+        done = stats.confirmed + stats.uncertain
+        confirmed = stats.confirmed
+        owners = stats.owners
+        uncertain = stats.uncertain
+
     logging.info(
-        "DONE | done=%d/%d | checked=%d | owners=%d (%.2f%% of checked) | failed=%d | time=%.2fs | %.1f wallet/s",
+        "DONE | processed=%d/%d | confirmed=%d | owners=%d (%.2f%% of confirmed) | uncertain=%d | %.2fs | %.1f wallet/s",
         done,
         total,
-        checked_count,
-        owned_count,
-        owned_count / checked_count * 100 if checked_count else 0.0,
-        failed_count,
+        confirmed,
+        owners,
+        owners / confirmed * 100 if confirmed else 0.0,
+        uncertain,
         elapsed,
         done / elapsed,
     )
 
-    if failed_count:
-        logging.warning("Uncertain rows were written separately, not as false: %s", CFG.failed_file)
+    if STOP_EVENT.is_set() and done < total:
+        logging.warning("Stopped early; rerun to resume from confirmed output")
+        return 130
+    if uncertain:
+        logging.warning("Uncertain rows were written to %s and were not treated as false", cfg.failed_file)
+    return 0
 
 
 if __name__ == "__main__":
-    t0 = time.time()
+    started_at = time.monotonic()
     try:
-        main()
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        STOP_EVENT.set()
+        raise SystemExit(130)
+    except Exception:
+        logging.exception("Fatal error")
+        raise SystemExit(1)
     finally:
-        print(f"Finished in {time.time() - t0:.2f}s")
+        print(f"Finished in {time.monotonic() - started_at:.2f}s")
