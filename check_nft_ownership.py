@@ -8,7 +8,8 @@ contract by calling balanceOf(address) through batched eth_call requests.
 Key properties:
 - Multiple RPC endpoints with chain-id validation, health scoring and cooldowns.
 - Thread-local keep-alive sessions.
-- Retries HTTP failures and retryable JSON-RPC batch failures.
+- Retries HTTP failures, missing batch items and retryable per-call JSON-RPC errors.
+- Marks RPC health only after semantic success, so throttling cooldowns work correctly.
 - Never converts an incomplete check into a confirmed false by default.
 - Bounded worker queue and dedicated CSV writer.
 - Correct wallet attribution if a worker crashes.
@@ -37,7 +38,7 @@ import signal
 import sys
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import CancelledError, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
@@ -353,6 +354,10 @@ def is_retryable_text(text: str) -> bool:
             "header not found",
             "missing trie node",
             "econnreset",
+            "408",
+            "425",
+            "429",
+            "500",
             "502",
             "503",
             "504",
@@ -387,7 +392,7 @@ def rpc_request_to_node(
     payload: dict[str, Any] | list[dict[str, Any]],
     *,
     expect_batch: bool,
-) -> dict[str, Any] | list[dict[str, Any]]:
+) -> tuple[dict[str, Any] | list[dict[str, Any]], float]:
     session = get_session(cfg, node.url)
     started = time.monotonic()
     response = session.post(
@@ -411,16 +416,22 @@ def rpc_request_to_node(
     if not expect_batch and not isinstance(data, dict):
         raise RuntimeError(f"RPC returned invalid single response: {truncate_error(data)}")
 
-    RPC_POOL.mark_success(node, latency)
-    return data
+    return data, latency
 
 
 def rpc_batch(cfg: Config, payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Execute a read-only JSON-RPC batch with failover and semantic retries.
+
+    A provider is marked healthy only after the batch is structurally complete enough
+    to consume. Missing responses and retryable per-call RPC errors trigger a retry,
+    even when the HTTP status itself was 200.
+    """
     if not payload:
         return []
 
     last_error = "unknown RPC error"
     attempted_nodes: set[str] = set()
+    expected_ids = {int(item["id"]) for item in payload if "id" in item}
 
     for attempt in range(1, cfg.max_retries + 1):
         if STOP_EVENT.is_set():
@@ -430,13 +441,28 @@ def rpc_batch(cfg: Config, payload: list[dict[str, Any]]) -> list[dict[str, Any]
         attempted_nodes.add(node.url)
 
         try:
-            raw = rpc_request_to_node(cfg, node, payload, expect_batch=True)
+            raw, latency = rpc_request_to_node(cfg, node, payload, expect_batch=True)
             assert isinstance(raw, list)
             data = [item for item in raw if isinstance(item, dict)]
+            mapped = response_by_id(data)
+            missing_ids = expected_ids - set(mapped)
+            retryable_errors = [
+                json_rpc_error_text(item)
+                for item in mapped.values()
+                if "error" in item and is_retryable_text(json_rpc_error_text(item))
+            ]
 
-            retry, batch_error = should_retry_batch_response(data, len(payload))
-            if retry:
-                raise RuntimeError(batch_error)
+            if missing_ids or retryable_errors:
+                parts: list[str] = []
+                if missing_ids:
+                    parts.append(f"missing {len(missing_ids)}/{len(expected_ids)} batch response(s)")
+                if retryable_errors:
+                    parts.append(" | ".join(retryable_errors[:3]))
+                raise RuntimeError("; ".join(parts))
+
+            # Non-retryable per-call errors are returned to the wallet checker, which
+            # records them as uncertain rather than silently converting them to false.
+            RPC_POOL.mark_success(node, latency)
             return data
 
         except (RequestException, RuntimeError) as exc:
@@ -444,7 +470,7 @@ def rpc_batch(cfg: Config, payload: list[dict[str, Any]]) -> list[dict[str, Any]
             throttled = is_throttle_text(last_error)
             RPC_POOL.mark_failure(node, throttled=throttled)
 
-            if attempt >= cfg.max_retries or not is_retryable_text(last_error):
+            if attempt >= cfg.max_retries or not is_retryable_text(last_error) and not last_error.startswith("missing "):
                 break
 
             logging.debug(
@@ -462,8 +488,10 @@ def rpc_batch(cfg: Config, payload: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def rpc_single(cfg: Config, node: RpcNode, method: str, params: list[Any]) -> dict[str, Any]:
     payload = make_rpc_call(1, method, params)
-    raw = rpc_request_to_node(cfg, node, payload, expect_batch=False)
+    raw, latency = rpc_request_to_node(cfg, node, payload, expect_batch=False)
     assert isinstance(raw, dict)
+    if "error" not in raw:
+        RPC_POOL.mark_success(node, latency)
     return raw
 
 
@@ -905,7 +933,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     parser.add_argument("--skip-contract-validation", action="store_true", default=env_bool("SKIP_CONTRACT_VALIDATION"))
     parser.add_argument("--allow-partial-false", action="store_true", default=env_bool("ALLOW_PARTIAL_FALSE"), help="Unsafe: allow false even if some calls failed")
     parser.add_argument("--resume-failed", action="store_true", default=env_bool("RESUME_FAILED"), help="Skip addresses already present in failed CSV")
-    parser.add_argument("--user-agent", default=os.getenv("USER_AGENT", "erc721-ownership-checker/2.0"))
+    parser.add_argument("--user-agent", default=os.getenv("USER_AGENT", "erc721-ownership-checker/3.0"))
     args = parser.parse_args(argv)
 
     rpc_urls = parse_rpc_urls(args.rpc_url)
@@ -954,7 +982,11 @@ def validate_paths(cfg: Config) -> None:
     if not cfg.contracts_file.is_file():
         raise FileNotFoundError(f"Contracts file not found: {cfg.contracts_file}")
 
-    resolved_outputs = {cfg.output_file.resolve(), cfg.failed_file.resolve(), cfg.log_file.resolve()}
+    output_paths = [cfg.output_file.resolve(), cfg.failed_file.resolve(), cfg.log_file.resolve()]
+    if len(set(output_paths)) != len(output_paths):
+        raise ValueError("Output, failed and log files must all be different")
+
+    resolved_outputs = set(output_paths)
     if cfg.input_file.resolve() in resolved_outputs or cfg.contracts_file.resolve() in resolved_outputs:
         raise ValueError("Input/contract file must not be reused as output or log file")
 
@@ -1055,8 +1087,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                 for future in done:
                     wallet = pending.pop(future)
+                    if future.cancelled():
+                        continue
                     try:
                         result = future.result()
+                    except CancelledError:
+                        continue
                     except Exception as exc:  # defensive boundary
                         logging.exception("Worker crashed for %s", wallet)
                         result = CheckResult(wallet, None, 0, len(contracts), len(contracts), f"worker_crashed: {truncate_error(exc)}")
