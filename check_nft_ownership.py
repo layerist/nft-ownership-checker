@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Robust high-throughput ERC-721 ownership checker (JSON-RPC batch edition) v4.
+Robust high-throughput ERC-721 ownership checker (JSON-RPC batch edition) v4.1.
 
 Checks whether every wallet owns at least one token in any supplied ERC-721
 contract by calling balanceOf(address) through batched eth_call requests.
@@ -49,6 +49,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -75,11 +76,11 @@ except ImportError:  # web3 is optional; raw JSON-RPC does not require it
     Web3 = None  # type: ignore[assignment]
 
 
-VERSION = "4.0"
+VERSION = "4.1"
 BALANCE_OF_SELECTOR = "70a08231"
 WRITE_SENTINEL = object()
 STATE_SCHEMA = 1
-RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 STOP_EVENT = threading.Event()
 THREAD_LOCAL = threading.local()
@@ -315,12 +316,15 @@ class RpcPool:
         return [node for node in self.nodes if node.is_active()]
 
     @contextmanager
-    def lease(self) -> Iterator[RpcNode]:
+    def lease(self, *, exclude_urls: Optional[set[str]] = None) -> Iterator[RpcNode]:
         while True:
             if STOP_EVENT.is_set():
                 raise StopRequested("stopped")
 
-            active = self.active_nodes()
+            active = [
+                node for node in self.active_nodes()
+                if exclude_urls is None or node.url not in exclude_urls
+            ]
             if not active:
                 reasons = "; ".join(
                     f"{redact_url(node.url)}: {node.disabled_reason or 'unavailable'}"
@@ -476,6 +480,8 @@ def parse_retry_after(value: Optional[str], maximum: float) -> Optional[float]:
     value = value.strip()
     try:
         seconds = float(value)
+        if not math.isfinite(seconds):
+            return None
         return min(maximum, max(0.0, seconds))
     except ValueError:
         pass
@@ -656,9 +662,17 @@ def index_rpc_responses(
     for item in responses:
         try:
             call_id = item.get("id")
-            if isinstance(call_id, bool) or call_id is None:
+            # JSON-RPC ids are strings, numbers, or null; our own ids are
+            # integers. Reject fractional numeric ids rather than truncating
+            # them into an unrelated request (e.g. 1.5 must not match 1).
+            if isinstance(call_id, bool):
                 continue
-            numeric_id = int(call_id)
+            if isinstance(call_id, int):
+                numeric_id = call_id
+            elif isinstance(call_id, str) and call_id.isascii() and call_id.isdecimal():
+                numeric_id = int(call_id)
+            else:
+                continue
         except (TypeError, ValueError):
             continue
 
@@ -828,9 +842,15 @@ def rpc_batch(
             raise StopRequested("stopped")
 
         current_payload = list(remaining.values())
+        # A provider which rejected this batch size cannot help by receiving
+        # the identical payload again. Try other nodes before splitting.
+        if batch_limit_nodes and not any(
+            node.url not in batch_limit_nodes for node in pool.active_nodes()
+        ):
+            break
 
         try:
-            with pool.lease() as node:
+            with pool.lease(exclude_urls=batch_limit_nodes) as node:
                 attempted_nodes.add(node.url)
                 try:
                     raw, latency = rpc_request_to_node(
@@ -995,7 +1015,7 @@ def rpc_single_direct(
 
 
 def parse_quantity(value: Any, *, field_name: str) -> int:
-    if not isinstance(value, str) or not value.startswith("0x"):
+    if not isinstance(value, str) or not value.startswith("0x") or len(value) < 3:
         raise ValueError(f"bad {field_name} result: {value!r}")
     return int(value, 16)
 
@@ -1074,6 +1094,8 @@ def validate_rpc_nodes(cfg: Config) -> int:
                 node.block_number,
                 "unchecked" if cfg.skip_batch_probe else "yes",
             )
+        except StopRequested:
+            raise
         except Exception as exc:
             reason = f"health check failed: {truncate_error(exc)}"
             RpcPool.disable(node, reason)
@@ -1245,67 +1267,110 @@ def _parse_result_counters(row: Mapping[str, Any]) -> Optional[tuple[int, int, i
     return checked, failed, total
 
 
-def load_addresses_from_csv(path: Path, *, kind: str) -> set[str]:
-    if not path.exists() or path.stat().st_size == 0:
-        return set()
-
+def _resume_row_address(row: Mapping[str | None, Any], kind: str) -> Optional[str]:
+    # A DictReader row with extra/missing columns is not a complete result.
+    if None in row or any(value is None for value in row.values()):
+        return None
+    address = normalize_evm_address((row.get("address") or "").strip())
+    if address is None or _parse_result_counters(row) is None:
+        return None
     if kind == "output":
-        expected_header = [
-            "address",
-            "owns_nft",
-            "checked_contracts",
-            "failed_contracts",
-            "total_contracts",
-        ]
-    elif kind == "failed":
-        expected_header = [
-            "address",
-            "checked_contracts",
-            "failed_contracts",
-            "total_contracts",
-            "error",
-        ]
-    else:
-        raise ValueError(f"unknown CSV kind: {kind}")
+        if (row.get("owns_nft") or "").strip().lower() not in {"true", "false"}:
+            return None
+    elif not (row.get("error") or "").strip():
+        return None
+    return address
 
+
+def _resume_header(kind: str) -> list[str]:
+    if kind == "output":
+        return ["address", "owns_nft", "checked_contracts", "failed_contracts", "total_contracts"]
+    if kind == "failed":
+        return ["address", "checked_contracts", "failed_contracts", "total_contracts", "error"]
+    raise ValueError(f"unknown CSV kind: {kind}")
+
+
+def load_addresses_from_csv(path: Path, *, kind: str) -> tuple[set[str], bool]:
+    """Read resumable records, reporting whether the CSV needs safe repair."""
+    if not path.exists() or path.stat().st_size == 0:
+        return set(), False
+
+    expected_header = _resume_header(kind)
     completed: set[str] = set()
     malformed_rows = 0
+    parse_error = False
     try:
         with path.open("r", encoding="utf-8-sig", newline="") as file:
-            reader = csv.DictReader(file)
+            reader = csv.DictReader(file, strict=True)
             if reader.fieldnames != expected_header:
                 raise RuntimeError(
-                    f"Unexpected CSV header in {path}: {reader.fieldnames!r}; expected {expected_header!r}"
+                    f"Unexpected CSV header in {path}: {reader.fieldnames!r}; "
+                    f"expected {expected_header!r}"
                 )
+            try:
+                for row in reader:
+                    address = _resume_row_address(row, kind)
+                    if address is None:
+                        malformed_rows += 1
+                    else:
+                        completed.add(address)
+            except csv.Error as exc:
+                # A torn quoted field can make DictReader raise at EOF.
+                # Already valid records remain usable after repair.
+                parse_error = True
+                logging.warning("Invalid CSV record in %s: %s", path, exc)
 
-            for row in reader:
-                address = normalize_evm_address((row.get("address") or "").strip())
-                counters = _parse_result_counters(row)
-                row_valid = address is not None and counters is not None
-
-                if kind == "output":
-                    status = (row.get("owns_nft") or "").strip().lower()
-                    row_valid = row_valid and status in {"true", "false"}
-                else:
-                    # A failed row should carry a reason. Requiring it also keeps
-                    # a torn/partial final CSV line from becoming resumable work.
-                    error_text = (row.get("error") or "").strip()
-                    row_valid = row_valid and bool(error_text)
-
-                if row_valid and address is not None:
-                    completed.add(address)
-                else:
-                    malformed_rows += 1
-    except (OSError, csv.Error) as exc:
+        with path.open("rb") as file:
+            file.seek(-1, os.SEEK_END)
+            ends_in_newline = file.read(1) in (b"\n", b"\r")
+    except (OSError, UnicodeError, csv.Error) as exc:
         raise RuntimeError(f"Cannot read resume file {path}: {exc}") from exc
 
     if malformed_rows:
-        logging.warning(
-            "Ignored %d malformed/torn row(s) while reading %s",
-            malformed_rows,
-            path,
-        )
-    return completed
+        logging.warning("Found %d malformed/torn row(s) in %s", malformed_rows, path)
+    return completed, malformed_rows > 0 or parse_error or not ends_in_newline
+
+
+def repair_resume_csv(path: Path, *, kind: str, fsync_writes: bool) -> None:
+    """Atomically retain valid CSV rows, dropping torn rows before any append.
+
+    In particular, appending after an unterminated quoted field can otherwise
+    swallow *future valid rows* into that broken field on the next resume.
+    """
+    header = _resume_header(kind)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(temp_name)
+    kept = 0
+    dropped = 0
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as target, \
+                path.open("r", encoding="utf-8-sig", newline="") as source:
+            reader = csv.DictReader(source, strict=True)
+            if reader.fieldnames != header:
+                raise RuntimeError(f"Unexpected CSV header in {path} during repair")
+            writer = csv.DictWriter(target, fieldnames=header, lineterminator="\n")
+            writer.writeheader()
+            try:
+                for row in reader:
+                    if _resume_row_address(row, kind) is not None:
+                        writer.writerow({key: row[key] for key in header})
+                        kept += 1
+                    else:
+                        dropped += 1
+            except csv.Error:
+                # An unterminated CSV field is unusable; preserve the rows
+                # successfully parsed before it and retry affected wallets.
+                dropped += 1
+            target.flush()
+            if fsync_writes:
+                os.fsync(target.fileno())
+        os.replace(tmp, path)
+        if fsync_writes:
+            fsync_directory(path.parent)
+        logging.warning("Repaired resume CSV %s: kept=%d, invalid=%d", path, kept, dropped)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def contracts_fingerprint(
@@ -1378,8 +1443,8 @@ def prepare_resume(
             except OSError as exc:
                 raise RuntimeError(f"Cannot clear {path}: {exc}") from exc
 
-    output_addresses = load_addresses_from_csv(cfg.output_file, kind="output")
-    failed_addresses = load_addresses_from_csv(cfg.failed_file, kind="failed")
+    output_addresses, output_needs_repair = load_addresses_from_csv(cfg.output_file, kind="output")
+    failed_addresses, failed_needs_repair = load_addresses_from_csv(cfg.failed_file, kind="failed")
     existing_rows = bool(output_addresses or failed_addresses)
 
     signature = contracts_fingerprint(
@@ -1404,6 +1469,13 @@ def prepare_resume(
                     "or --force-resume-mismatch only if you intentionally accept stale/mismatched results."
                 )
             logging.warning("FORCED unsafe resume: %s", details)
+
+    # Repair only after verifying the scan fingerprint, so a refused resume
+    # never modifies an unrelated set of CSV results.
+    if output_needs_repair:
+        repair_resume_csv(cfg.output_file, kind="output", fsync_writes=cfg.fsync_writes)
+    if failed_needs_repair and cfg.resume_failed:
+        repair_resume_csv(cfg.failed_file, kind="failed", fsync_writes=cfg.fsync_writes)
 
     created_at = state.get("created_at") if state else None
     state_payload = {
@@ -1708,7 +1780,8 @@ def writer_loop(
                         ]
                     )
 
-                if len(ok_buffer) + len(failed_buffer) >= cfg.writer_batch_size:
+                if (len(ok_buffer) + len(failed_buffer) >= cfg.writer_batch_size
+                        or time.monotonic() - last_flush >= cfg.writer_flush_seconds):
                     flush()
             finally:
                 work_queue.task_done()
@@ -1942,6 +2015,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     )
     args = parser.parse_args(argv)
 
+    for option in (
+        "base_delay", "max_delay", "max_retry_after", "request_timeout",
+        "connect_timeout", "writer_flush_seconds",
+    ):
+        if not math.isfinite(getattr(args, option)):
+            parser.error(f"--{option.replace('_', '-')} must be finite")
+
     rpc_urls = parse_rpc_urls(args.rpc_url)
     if not rpc_urls:
         parser.error("RPC URL is empty. Set RPC_URLS/RPC_URL/INFURA_URL or pass --rpc-url")
@@ -1955,10 +2035,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     failed_file = Path(args.failed)
     state_file = Path(args.state) if str(args.state).strip() else Path(str(output_file) + ".state.json")
 
-    if output_file == failed_file:
+    if output_file.resolve() == failed_file.resolve():
         parser.error("--output and --failed must point to different files")
     if args.contract_batch_size > 1000:
-        logging.warning("Very large RPC batches may be rejected by providers")
+        print("warning: Very large RPC batches may be rejected by providers", file=sys.stderr)
 
     try:
         expected_chain_id = parse_optional_int(args.expected_chain_id)
@@ -2028,9 +2108,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     global RPC_POOL
 
     cfg = parse_args(argv)
+    # Reject output/input path collisions before FileHandler can modify a
+    # protected input file (or a file intended for a different output).
+    validate_paths(cfg)
     setup_logging(cfg.log_file, cfg.log_level)
     install_signal_handlers()
-    validate_paths(cfg)
     RPC_POOL = RpcPool(
         cfg.rpc_urls,
         max_concurrency_per_node=cfg.rpc_concurrency_per_node,
@@ -2217,8 +2299,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rpc["batch_splits"],
     )
 
-    if STOP_EVENT.is_set() and done_count < total:
-        logging.warning("Stopped early; rerun with the same scan definition to resume")
+    if STOP_EVENT.is_set():
+        logging.warning("Stopped; rerun with the same scan definition to resume")
         return 130
     if uncertain:
         logging.warning(
@@ -2232,7 +2314,7 @@ if __name__ == "__main__":
     started_at = time.monotonic()
     try:
         raise SystemExit(main())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, StopRequested):
         STOP_EVENT.set()
         raise SystemExit(130)
     except Exception:
