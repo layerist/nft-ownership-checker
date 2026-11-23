@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Robust high-throughput ERC-721 ownership checker (JSON-RPC batch edition) v4.2.
+Robust high-throughput ERC-721 ownership checker (JSON-RPC batch edition) v4.3.
 
 Checks whether every wallet owns at least one token in any supplied ERC-721
 contract by calling balanceOf(address) through batched eth_call requests.
@@ -18,8 +18,8 @@ Major properties:
   requested with --allow-partial-false.
 - Contract bytecode validation is fail-open: uncertain contracts remain in the
   scan rather than being silently dropped.
-- Resume safety checks prevent reusing results from a different chain,
-  contract set, block tag, validation mode, or partial-false policy.
+- Resume safety checks cover both the supplied contracts and the effective
+  post-validation contract set, as well as chain, block tag and scan policies.
   Forced unsafe resumes stay marked unsafe until a fresh scan.
 - Dedicated buffered CSV writer, bounded in-flight work, crash attribution,
   graceful interruption, and optional fsync durability.
@@ -77,10 +77,10 @@ except ImportError:  # web3 is optional; raw JSON-RPC does not require it
     Web3 = None  # type: ignore[assignment]
 
 
-VERSION = "4.2"
+VERSION = "4.3"
 BALANCE_OF_SELECTOR = "70a08231"
 WRITE_SENTINEL = object()
-STATE_SCHEMA = 1
+STATE_SCHEMA = 2
 RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 STOP_EVENT = threading.Event()
@@ -324,7 +324,7 @@ class RpcPool:
     def note_batch_rejected(self, size: int) -> None:
         if size <= 1:
             return
-        new_limit = max(1, size // 2)
+        new_limit = max(1, (size + 1) // 2)
         with self._batch_limit_lock:
             if self._batch_limit is None or new_limit < self._batch_limit:
                 self._batch_limit = new_limit
@@ -735,7 +735,7 @@ def rpc_request_to_node(
         # Force a fresh pool/connection on the next attempt. This helps with
         # broken keep-alive sockets, stale DNS, and provider-side disconnects.
         discard_thread_session(node.url)
-        text = truncate_error(exc)
+        text = truncate_error(str(exc).replace(node.url, redact_url(node.url)))
         raise RpcRequestError(
             f"transport error: {text}",
             retryable=True,
@@ -822,7 +822,10 @@ def rpc_batch(
     for item in payload:
         if "id" not in item:
             raise ValueError("Every JSON-RPC batch item must contain an id")
-        call_id = int(item["id"])
+        raw_id = item["id"]
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            raise ValueError(f"JSON-RPC batch request id must be an integer: {raw_id!r}")
+        call_id = raw_id
         if call_id in seen_ids:
             raise ValueError(f"Duplicate JSON-RPC request id: {call_id}")
         seen_ids.add(call_id)
@@ -831,22 +834,23 @@ def rpc_batch(
     pool = require_rpc_pool()
     learned_limit = pool.batch_limit()
     if learned_limit is not None and len(payload) > learned_limit:
-        groups = list(chunked(payload, learned_limit))
-        for _ in range(len(groups) - 1):
-            pool.metrics.add_split()
-        return [
-            item
-            for group in groups
-            for item in rpc_batch(cfg, list(group), _split_depth=_split_depth + 1)
-        ]
+        combined: list[dict[str, Any]] = []
+        for group_index, group in enumerate(chunked(payload, learned_limit)):
+            if group_index:
+                pool.metrics.add_split()
+            combined.extend(rpc_batch(cfg, list(group), _split_depth=_split_depth + 1))
+        return combined
 
     remaining: dict[int, dict[str, Any]] = {
-        int(item["id"]): item for item in payload
+        item["id"]: item for item in payload
     }
     final: dict[int, dict[str, Any]] = {}
     last_errors: dict[int, str] = {}
     attempted_nodes: set[str] = set()
-    batch_limit_nodes: set[str] = set()
+    # Track the smallest batch size each node rejected. A node which rejects
+    # 80 calls should be eligible again after some calls succeeded elsewhere
+    # and the unresolved subset has fallen below 80.
+    batch_limit_nodes: dict[str, int] = {}
     rejected_batch_size: Optional[int] = None
 
     for attempt in range(1, cfg.max_retries + 1):
@@ -856,15 +860,18 @@ def rpc_batch(
             raise StopRequested("stopped")
 
         current_payload = list(remaining.values())
-        # A provider which rejected this batch size cannot help by receiving
-        # the identical payload again. Try other nodes before splitting.
-        if batch_limit_nodes and not any(
-            node.url not in batch_limit_nodes for node in pool.active_nodes()
+        # Only exclude providers that rejected this size or a smaller one.
+        excluded_nodes = {
+            url for url, rejected_size in batch_limit_nodes.items()
+            if len(current_payload) >= rejected_size
+        }
+        if excluded_nodes and not any(
+            node.url not in excluded_nodes for node in pool.active_nodes()
         ):
             break
 
         try:
-            with pool.lease(exclude_urls=batch_limit_nodes) as node:
+            with pool.lease(exclude_urls=excluded_nodes) as node:
                 attempted_nodes.add(node.url)
                 try:
                     raw, latency = rpc_request_to_node(
@@ -876,12 +883,15 @@ def rpc_batch(
                     )
                 except RpcRequestError as exc:
                     pool.metrics.add_failure(throttled=exc.throttled)
-                    RpcPool.mark_failure(
-                        cfg,
-                        node,
-                        throttled=exc.throttled,
-                        retry_after=exc.retry_after,
-                    )
+                    # A batch-size rejection is not a health/rate-limit
+                    # failure: smaller requests should run immediately.
+                    if not (exc.batch_too_large and len(current_payload) > 1):
+                        RpcPool.mark_failure(
+                            cfg,
+                            node,
+                            throttled=exc.throttled,
+                            retry_after=exc.retry_after,
+                        )
                     error_text = truncate_error(exc)
                     for call_id in remaining:
                         last_errors[call_id] = error_text
@@ -891,7 +901,10 @@ def rpc_batch(
                             len(current_payload) if rejected_batch_size is None
                             else min(rejected_batch_size, len(current_payload))
                         )
-                        batch_limit_nodes.add(node.url)
+                        batch_limit_nodes[node.url] = min(
+                            batch_limit_nodes.get(node.url, len(current_payload)),
+                            len(current_payload),
+                        )
                         if len(batch_limit_nodes) >= len(pool.active_nodes()):
                             break
 
@@ -917,11 +930,13 @@ def rpc_batch(
                         len(current_payload) if rejected_batch_size is None
                         else min(rejected_batch_size, len(current_payload))
                     )
-                    batch_limit_nodes.add(node.url)
+                    batch_limit_nodes[node.url] = min(
+                        batch_limit_nodes.get(node.url, len(current_payload)),
+                        len(current_payload),
+                    )
                     for call_id in remaining:
                         last_errors[call_id] = batch_errors[0]
                     pool.metrics.add_failure(throttled=False)
-                    RpcPool.mark_failure(cfg, node, throttled=False)
                     if len(batch_limit_nodes) >= len(pool.active_nodes()):
                         break
                     continue
@@ -1076,7 +1091,12 @@ def rpc_single_direct(
 
 
 def parse_quantity(value: Any, *, field_name: str) -> int:
-    if not isinstance(value, str) or not value.startswith("0x") or len(value) < 3:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("0x")
+        or len(value) < 3
+        or any(char not in "0123456789abcdefABCDEF" for char in value[2:])
+    ):
         raise ValueError(f"bad {field_name} result: {value!r}")
     return int(value, 16)
 
@@ -1502,6 +1522,7 @@ def prepare_resume(
     *,
     chain_id: int,
     contracts: Sequence[str],
+    effective_contracts: Optional[Sequence[str]] = None,
 ) -> set[str]:
     if cfg.fresh:
         logging.warning("Fresh mode: clearing prior output, failed, and state files")
@@ -1521,12 +1542,34 @@ def prepare_resume(
         block_tag=cfg.block_tag,
         allow_partial_false=cfg.allow_partial_false,
     )
+    effective_contracts = contracts if effective_contracts is None else effective_contracts
+    effective_signature = contracts_fingerprint(
+        chain_id,
+        effective_contracts,
+        block_tag=cfg.block_tag,
+        allow_partial_false=cfg.allow_partial_false,
+    )
     state = read_state(cfg.state_file)
+    # Schema 1 did not record the effective contract list. It can be migrated
+    # safely only when validation was disabled: in that case nothing was ever
+    # dropped from the supplied contract list.
+    safe_legacy_state = bool(
+        state
+        and state.get("schema") == 1
+        and state.get("skip_contract_validation") is True
+        and cfg.skip_contract_validation
+    )
 
     mismatches: list[str] = []
     if existing_rows:
         if not state or state.get("signature") != signature:
             mismatches.append("missing or different scan fingerprint")
+        if not state or (state.get("schema") != STATE_SCHEMA and not safe_legacy_state):
+            mismatches.append("missing or outdated resume state schema")
+        if not state or (
+            state.get("effective_signature") != effective_signature and not safe_legacy_state
+        ):
+            mismatches.append("post-validation contract set changed or was not recorded")
         if state and bool(state.get("skip_contract_validation", False)) != cfg.skip_contract_validation:
             mismatches.append("contract-validation mode changed")
         if state and state.get("unsafe_resume", False):
@@ -1552,8 +1595,10 @@ def prepare_resume(
         "schema": STATE_SCHEMA,
         "checker_version": VERSION,
         "signature": signature,
+        "effective_signature": effective_signature,
         "chain_id": chain_id,
         "contract_count": len(contracts),
+        "effective_contract_count": len(effective_contracts),
         "block_tag": cfg.block_tag,
         "allow_partial_false": cfg.allow_partial_false,
         "skip_contract_validation": cfg.skip_contract_validation,
@@ -1953,15 +1998,19 @@ def parse_optional_int(value: str) -> Optional[int]:
     value = value.strip()
     if not value:
         return None
-    return int(value, 0)
+    result = int(value, 16 if value.lower().startswith("0x") else 10)
+    if result < 0:
+        raise ValueError("chain id must be non-negative")
+    return result
 
 
 def validate_block_tag(value: str) -> str:
     text = value.strip().lower()
     if text in {"latest", "safe", "finalized", "pending", "earliest"}:
         return text
-    if text.startswith("0x"):
-        int(text, 16)
+    if text.startswith("0x") and len(text) > 2 and all(
+        char in "0123456789abcdef" for char in text[2:]
+    ):
         return text
     raise argparse.ArgumentTypeError(
         "block tag must be latest/safe/finalized/pending/earliest or a 0x-prefixed block number"
@@ -2099,6 +2148,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
     rpc_urls = parse_rpc_urls(args.rpc_url)
     if not rpc_urls:
         parser.error("RPC URL is empty. Set RPC_URLS/RPC_URL/INFURA_URL or pass --rpc-url")
+    for url in rpc_urls:
+        try:
+            parsed_url = urlsplit(url)
+            valid = parsed_url.scheme.lower() in {"http", "https"} and bool(parsed_url.hostname)
+            # Force validation of the optional port (urlsplit.port can raise).
+            _ = parsed_url.port
+        except ValueError:
+            valid = False
+        if not valid:
+            parser.error(f"Invalid HTTP(S) RPC endpoint: {redact_url(url)}")
 
     threads = max(1, args.threads)
     max_inflight = args.max_inflight if args.max_inflight > 0 else threads * 4
@@ -2205,7 +2264,20 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
         logging.info("No valid contract addresses found")
         return 0
 
-    completed = prepare_resume(cfg, chain_id=chain_id, contracts=contracts)
+    # The effective contract set can differ between runs (e.g. an address
+    # previously had no code, then a contract was deployed there). Validate
+    # it before comparing resume fingerprints to avoid stale false negatives.
+    supplied_contracts = contracts
+    contracts = filter_contracts(cfg, contracts)
+    if not contracts:
+        raise RuntimeError("No usable contract addresses remain")
+
+    completed = prepare_resume(
+        cfg,
+        chain_id=chain_id,
+        contracts=supplied_contracts,
+        effective_contracts=contracts,
+    )
     if completed:
         before = len(addresses)
         addresses = [address for address in addresses if address not in completed]
@@ -2214,10 +2286,6 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
     if not addresses:
         logging.info("Nothing to do")
         return 0
-
-    contracts = filter_contracts(cfg, contracts)
-    if not contracts:
-        raise RuntimeError("No usable contract addresses remain")
 
     # Startup probes and contract validation are useful operational work but
     # should not distort the wallet-scan throughput/retry counters.
@@ -2338,7 +2406,7 @@ def _run(argv: Optional[Sequence[str]] = None) -> int:
                         break
         writer.join(timeout=30)
         if writer.is_alive():
-            logging.error("CSV writer did not stop cleanly")
+            raise RuntimeError("CSV writer did not stop cleanly; output may be incomplete")
     if writer_errors:
         raise RuntimeError("CSV writer failed") from writer_errors[0]
 
